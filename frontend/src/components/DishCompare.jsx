@@ -119,47 +119,57 @@ function ItemRow({ item, dish, restaurantId, restaurantName }) {
 
   return (
     <li className="item-row">
-      <div className="item-row-main">
-        <span className="item-name">{item.name}</span>
-        {item.rating !== null && <span className="item-rating">★ {item.rating}</span>}
-        <span className="item-price">₹{item.price}</span>
+      <div className="item-photo">
+        {item.imageUrl ? (
+          <img src={item.imageUrl} alt={item.name} loading="lazy" />
+        ) : (
+          <span className="item-photo-placeholder">No photo available</span>
+        )}
       </div>
 
-      {!coupon && (
-        <button className="deal-button" onClick={checkDeal} disabled={checking} type="button">
-          {checking ? "Checking best deal…" : "Check best coupon & real price"}
-        </button>
-      )}
-
-      {couponError && <p className="error-text">{couponError}</p>}
-
-      {coupon && !coupon.available && (
-        <div className="coupon-line muted">{coupon.reason || "No deal available."}</div>
-      )}
-
-      {coupon && coupon.available && (
-        <div className="coupon-result">
-          {coupon.applied ? (
-            <>
-              <div className="coupon-line">
-                <span className="coupon-code">{coupon.couponCode}</span> applied — save ₹
-                {coupon.couponDiscount}
-                {coupon.freeDelivery ? " · free delivery" : ""}
-              </div>
-              <div className="effective-price">
-                Pay ₹{coupon.toPay}
-                <span className="savings"> (was ₹{coupon.itemTotal})</span>
-              </div>
-            </>
-          ) : (
-            <div className="coupon-line muted">
-              {coupon.couponCode
-                ? `Best coupon ${coupon.couponCode} needs a higher order value — doesn't apply to this item alone (₹${coupon.itemTotal}).`
-                : `No coupon applies to this item alone (₹${coupon.itemTotal}).`}
-            </div>
-          )}
+      <div className="item-details">
+        <div className="item-row-main">
+          <span className="item-name">{item.name}</span>
+          {item.rating !== null && <span className="item-rating">★ {item.rating}</span>}
+          <span className="item-price">₹{item.price}</span>
         </div>
-      )}
+
+        {!coupon && (
+          <button className="deal-button" onClick={checkDeal} disabled={checking} type="button">
+            {checking ? "Checking best deal…" : "Check best coupon & real price"}
+          </button>
+        )}
+
+        {couponError && <p className="error-text">{couponError}</p>}
+
+        {coupon && !coupon.available && (
+          <div className="coupon-line muted">{coupon.reason || "No deal available."}</div>
+        )}
+
+        {coupon && coupon.available && (
+          <div className="coupon-result">
+            {coupon.applied ? (
+              <>
+                <div className="coupon-line">
+                  <span className="coupon-code">{coupon.couponCode}</span> applied — save ₹
+                  {coupon.couponDiscount}
+                  {coupon.freeDelivery ? " · free delivery" : ""}
+                </div>
+                <div className="effective-price">
+                  Pay ₹{coupon.toPay}
+                  <span className="savings"> (was ₹{coupon.itemTotal})</span>
+                </div>
+              </>
+            ) : (
+              <div className="coupon-line muted">
+                {coupon.couponCode
+                  ? `Best coupon ${coupon.couponCode} needs a higher order value — doesn't apply to this item alone (₹${coupon.itemTotal}).`
+                  : `No coupon applies to this item alone (₹${coupon.itemTotal}).`}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
     </li>
   );
 }

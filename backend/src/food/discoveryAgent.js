@@ -84,6 +84,10 @@ export async function discoverRestaurantsForDish({ dish, addressId }) {
         name: item.name,
         price: item.price,
         rating: item.rating ? Number(item.rating) : null,
+        // Swiggy only returns a photo for some items within a restaurant
+        // (often under half) — no fallback substitution, the frontend shows
+        // an explicit "no photo available" placeholder for the rest.
+        imageUrl: item.imageUrl || null,
       }))
       .sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0))
       .slice(0, MAX_ITEMS_PER_RESTAURANT);
