@@ -5,6 +5,7 @@ import { config } from "../config.js";
 
 const MAX_CANDIDATES = 10;
 const SEARCH_CONCURRENCY = 4; // same ~4 req/s burst ceiling as the coupon fetch
+const MAX_ITEMS_PER_RESTAURANT = 6;
 
 const SELECT_TOOL = {
   type: "function",
@@ -68,9 +69,25 @@ export async function discoverRestaurantsForDish({ dish, addressId }) {
       restaurantIdOfAddedItem: restaurantId,
     });
     const items = Array.isArray(menuResult?.items) ? menuResult.items : [];
-    if (items.length === 0) return null; // scoped search_menu confirms this restaurant doesn't serve it
 
-    const cheapest = items.reduce((min, item) => (min === null || item.price < min.price ? item : min), null);
+    // Non-veg only, per user preference. search_menu's vegFilter param only
+    // supports veg-only (1) or mixed (0/omitted) — there's no non-veg-only
+    // filter on the tool itself, so this filters client-side. isVeg/veg is
+    // only present (truthy) on veg items in samples seen; its absence is
+    // treated as non-veg.
+    const nonVegItems = items.filter((item) => item.menu_item_id && !item.isVeg && !item.veg);
+    if (nonVegItems.length === 0) return null; // no non-veg options here for this dish
+
+    const ranked = nonVegItems
+      .map((item) => ({
+        menuItemId: String(item.menu_item_id),
+        name: item.name,
+        price: item.price,
+        rating: item.rating ? Number(item.rating) : null,
+      }))
+      .sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0))
+      .slice(0, MAX_ITEMS_PER_RESTAURANT);
+
     const meta = metaById.get(String(restaurantId));
     return {
       restaurantId: String(restaurantId),
@@ -79,9 +96,7 @@ export async function discoverRestaurantsForDish({ dish, addressId }) {
       distanceKm: meta?.distanceKm,
       deliveryTimeMinutes: meta?.deliveryTimeMinutes,
       rating: meta?.avgRating,
-      matchedItemName: cheapest.name,
-      matchedItemPrice: cheapest.price,
-      isVeg: Boolean(cheapest.isVeg),
+      items: ranked,
     };
   });
 

@@ -4,8 +4,8 @@ import { foodClient } from "../mcp/foodClient.js";
 // empty with or without a cart, even for a specific couponCode). Coupons only
 // surface through the cart's `offers` field: building a cart makes Swiggy
 // auto-suggest the single best coupon, and applying it yields the real
-// discount. So to price the best coupon for one restaurant we build a
-// throwaway cart with its cheapest matching item, read the coupon, then flush.
+// discount. So to price the best coupon for one item we build a throwaway
+// cart with just that item, read the coupon, then flush.
 //
 // Food carts are single-restaurant and global, so two of these running at once
 // would clobber each other's cart — serialize with a simple promise chain.
@@ -18,20 +18,22 @@ export function checkBestCoupon(params) {
   return run;
 }
 
-async function checkBestCouponInner({ restaurantId, dish, addressId, restaurantName }) {
+async function checkBestCouponInner({ restaurantId, dish, menuItemId, addressId, restaurantName }) {
+  // Re-search rather than trust a stale menuItemId from an earlier discovery
+  // call — price/stock can change between when the comparison loaded and
+  // when the user clicks "check deal".
   const menu = await foodClient.searchMenu({
     addressId,
     query: dish,
     restaurantIdOfAddedItem: restaurantId,
   });
   const items = Array.isArray(menu?.items) ? menu.items : [];
-  const inStock = items.filter((i) => i.inStock !== 0 && i.menu_item_id);
-  if (inStock.length === 0) {
-    return { available: false, reason: "This dish is no longer on the menu here." };
+  const target = items.find((i) => String(i.menu_item_id) === menuItemId && i.inStock !== 0);
+  if (!target) {
+    return { available: false, reason: "This item is no longer available here." };
   }
 
-  const cheapest = inStock.reduce((min, i) => (min === null || i.price < min.price ? i : min), null);
-  const cartItems = [toCartItem(cheapest)];
+  const cartItems = [toCartItem(target)];
 
   try {
     const updated = await foodClient.updateFoodCart({
@@ -57,9 +59,9 @@ async function checkBestCouponInner({ restaurantId, dish, addressId, restaurantN
 
     return {
       available: true,
-      itemName: cheapest.name,
-      itemPrice: cheapest.price,
-      itemTotal: pricing.item_total ?? cheapest.price,
+      itemName: target.name,
+      itemPrice: target.price,
+      itemTotal: pricing.item_total ?? target.price,
       toPay: pricing.to_pay ?? null,
       // The best coupon Swiggy surfaced for this cart. `applied` is true only
       // when it actually reduced the price (discount > 0); otherwise it's a

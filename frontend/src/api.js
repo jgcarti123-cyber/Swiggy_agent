@@ -33,10 +33,10 @@ export const api = {
   saveAddress: (addressId, label, raw) =>
     request("/api/food/address", { method: "POST", body: JSON.stringify({ addressId, label, raw }) }),
   compareDish: (dish) => request(`/api/food/compare?dish=${encodeURIComponent(dish)}`),
-  couponCheck: (restaurantId, dish, restaurantName) =>
+  couponCheck: (restaurantId, menuItemId, dish, restaurantName) =>
     request("/api/food/coupon-check", {
       method: "POST",
-      body: JSON.stringify({ restaurantId, dish, restaurantName }),
+      body: JSON.stringify({ restaurantId, menuItemId, dish, restaurantName }),
     }),
   addToFoodCart: (payload) =>
     request("/api/food/cart/add", { method: "POST", body: JSON.stringify(payload) }),

@@ -59,7 +59,12 @@ export function InstamartChat() {
 
   return (
     <section className="panel instamart-panel">
-      <h2>Instamart chat</h2>
+      <header className="panel-header">
+        <h2>Pantry Pal</h2>
+        <p className="panel-sub">
+          Tell me what you need in plain words and I'll build your Instamart cart for you.
+        </p>
+      </header>
       <div className="instamart-layout">
         <div className="chat-column">
           <div className="chat-messages">

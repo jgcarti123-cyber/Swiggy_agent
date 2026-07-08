@@ -35,10 +35,16 @@ export function DishCompare() {
 
   return (
     <section className="panel">
-      <h2>Food dish compare</h2>
+      <header className="panel-header">
+        <h2>Feast Finder</h2>
+        <p className="panel-sub">
+          Type a dish and see open restaurants near you, ranked by rating, with non-veg options for
+          that dish and their real coupon price.
+        </p>
+      </header>
       <AddressPicker onSelected={() => setHasAddress(true)} />
 
-      <form onSubmit={search}>
+      <form className="search-row" onSubmit={search}>
         <input
           value={dish}
           onChange={(e) => setDish(e.target.value)}
@@ -46,7 +52,7 @@ export function DishCompare() {
           disabled={!hasAddress}
         />
         <button type="submit" disabled={!hasAddress || loading}>
-          {loading ? "Searching (checking nearby restaurants)…" : "Compare"}
+          {loading ? "Searching…" : "Compare"}
         </button>
       </form>
 
@@ -68,23 +74,6 @@ export function DishCompare() {
 }
 
 function RestaurantCard({ restaurant: r, dish }) {
-  const [coupon, setCoupon] = useState(null);
-  const [checking, setChecking] = useState(false);
-  const [couponError, setCouponError] = useState(null);
-
-  async function checkDeal() {
-    setChecking(true);
-    setCouponError(null);
-    try {
-      const result = await api.couponCheck(r.restaurantId, dish, r.restaurantName);
-      setCoupon(result);
-    } catch (err) {
-      setCouponError(err.message);
-    } finally {
-      setChecking(false);
-    }
-  }
-
   return (
     <li className="restaurant-card">
       <div className="restaurant-card-main">
@@ -95,8 +84,45 @@ function RestaurantCard({ restaurant: r, dish }) {
           {r.distanceKm ? ` · ${r.distanceKm} km` : ""}
         </span>
       </div>
-      <div className="restaurant-card-item">
-        {r.matchedItem?.name} — ₹{r.basePrice}
+      <ul className="item-list">
+        {r.items.map((item) => (
+          <ItemRow
+            key={item.menuItemId}
+            item={item}
+            dish={dish}
+            restaurantId={r.restaurantId}
+            restaurantName={r.restaurantName}
+          />
+        ))}
+      </ul>
+    </li>
+  );
+}
+
+function ItemRow({ item, dish, restaurantId, restaurantName }) {
+  const [coupon, setCoupon] = useState(null);
+  const [checking, setChecking] = useState(false);
+  const [couponError, setCouponError] = useState(null);
+
+  async function checkDeal() {
+    setChecking(true);
+    setCouponError(null);
+    try {
+      const result = await api.couponCheck(restaurantId, item.menuItemId, dish, restaurantName);
+      setCoupon(result);
+    } catch (err) {
+      setCouponError(err.message);
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  return (
+    <li className="item-row">
+      <div className="item-row-main">
+        <span className="item-name">{item.name}</span>
+        {item.rating !== null && <span className="item-rating">★ {item.rating}</span>}
+        <span className="item-price">₹{item.price}</span>
       </div>
 
       {!coupon && (
@@ -121,15 +147,15 @@ function RestaurantCard({ restaurant: r, dish }) {
                 {coupon.freeDelivery ? " · free delivery" : ""}
               </div>
               <div className="effective-price">
-                Pay ₹{coupon.toPay} for {coupon.itemName}
+                Pay ₹{coupon.toPay}
                 <span className="savings"> (was ₹{coupon.itemTotal})</span>
               </div>
             </>
           ) : (
             <div className="coupon-line muted">
               {coupon.couponCode
-                ? `Best coupon ${coupon.couponCode} needs a higher order value — doesn't apply to ${coupon.itemName} alone (₹${coupon.itemTotal}).`
-                : `No coupon applies to ${coupon.itemName} alone (₹${coupon.itemTotal}).`}
+                ? `Best coupon ${coupon.couponCode} needs a higher order value — doesn't apply to this item alone (₹${coupon.itemTotal}).`
+                : `No coupon applies to this item alone (₹${coupon.itemTotal}).`}
             </div>
           )}
         </div>
