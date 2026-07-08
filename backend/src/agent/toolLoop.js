@@ -1,4 +1,4 @@
-import { groq } from "./groqClient.js";
+import { createCompletionWithRetry } from "./groqClient.js";
 import { config } from "../config.js";
 
 // Groq has no server-side tool execution like Anthropic's beta MCP
@@ -12,7 +12,7 @@ export async function runToolLoop({ messages, tools, executeTool, finalToolName,
 
   for (let i = 0; i < maxIterations; i++) {
     const t0 = Date.now();
-    const completion = await groq.chat.completions.create({
+    const completion = await createCompletionWithRetry({
       model: config.groqModel,
       reasoning_effort: "low",
       messages,

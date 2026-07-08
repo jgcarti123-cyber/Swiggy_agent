@@ -1,6 +1,6 @@
 import { foodClient } from "../mcp/foodClient.js";
 import { mapWithConcurrency } from "../utils/concurrency.js";
-import { groq } from "../agent/groqClient.js";
+import { createCompletionWithRetry } from "../agent/groqClient.js";
 import { config } from "../config.js";
 
 const MAX_CANDIDATES = 10;
@@ -23,6 +23,36 @@ const SELECT_TOOL = {
         },
       },
       required: ["restaurantIds"],
+    },
+  },
+};
+
+const RELEVANCE_TOOL = {
+  type: "function",
+  function: {
+    name: "report_relevant_items",
+    description:
+      "For each restaurant, report which menu_item_ids are genuinely the requested dish, using real-world food knowledge — not literal keyword matching. Creatively/branded-named items (e.g. \"The Cluckinator\" at a burger place) DO count if they actually are that dish. Exclude items that are a different dish that merely shares an ingredient or cuisine (e.g. a plain chicken biryani is NOT butter chicken).",
+    parameters: {
+      type: "object",
+      properties: {
+        matches: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              restaurantId: { type: "string" },
+              menuItemIds: {
+                type: "array",
+                items: { type: "string" },
+                description: "menu_item_ids at this restaurant that are genuinely the requested dish",
+              },
+            },
+            required: ["restaurantId", "menuItemIds"],
+          },
+        },
+      },
+      required: ["matches"],
     },
   },
 };
@@ -76,10 +106,16 @@ export async function discoverRestaurantsForDish({ dish, addressId }) {
     // only present (truthy) on veg items in samples seen; its absence is
     // treated as non-veg.
     const nonVegItems = items.filter((item) => item.menu_item_id && !item.isVeg && !item.veg);
-    if (nonVegItems.length === 0) return null; // no non-veg options here for this dish
+    if (nonVegItems.length === 0) return null;
 
-    const ranked = nonVegItems
-      .map((item) => ({
+    const meta = metaById.get(String(restaurantId));
+    return {
+      restaurantId: String(restaurantId),
+      restaurantName: meta?.name,
+      distanceKm: meta?.distanceKm,
+      deliveryTimeMinutes: meta?.deliveryTimeMinutes,
+      rating: meta?.avgRating,
+      items: nonVegItems.map((item) => ({
         menuItemId: String(item.menu_item_id),
         name: item.name,
         price: item.price,
@@ -88,23 +124,36 @@ export async function discoverRestaurantsForDish({ dish, addressId }) {
         // (often under half) — no fallback substitution, the frontend shows
         // an explicit "no photo available" placeholder for the rest.
         imageUrl: item.imageUrl || null,
-      }))
-      .sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0))
-      .slice(0, MAX_ITEMS_PER_RESTAURANT);
-
-    const meta = metaById.get(String(restaurantId));
-    return {
-      restaurantId: String(restaurantId),
-      restaurantName: meta?.name,
-      availabilityStatus: "OPEN", // already filtered above
-      distanceKm: meta?.distanceKm,
-      deliveryTimeMinutes: meta?.deliveryTimeMinutes,
-      rating: meta?.avgRating,
-      items: ranked,
+      })),
     };
   });
 
-  return { restaurants: checked.filter(Boolean) };
+  const withMatches = checked.filter(Boolean);
+  if (withMatches.length === 0) return { restaurants: [] };
+
+  // A real Swiggy behavior: when a restaurant has no genuine match, scoped
+  // search_menu doesn't return an empty list — it falls back to
+  // loosely-related items from that menu (verified live: querying "butter
+  // chicken" at a biryani specialist returned 10 items, none of them butter
+  // chicken). A strict keyword filter fixed that but broke the opposite case
+  // — restaurants with creatively-named items that ARE genuine matches (e.g.
+  // "The Cluckinator" at a burger specialist) got wrongly excluded, since
+  // "burger" never appears in the name. Telling real matches from loose
+  // fallback results is a judgment call, not a string-matching problem, so a
+  // single bounded LLM pass judges relevance across all restaurants at once.
+  const relevantIdsByRestaurant = await judgeRelevantItems(dish, withMatches);
+
+  const ranked = withMatches
+    .map((restaurant) => {
+      const relevantIds = relevantIdsByRestaurant.get(restaurant.restaurantId);
+      const items = (relevantIds ? restaurant.items.filter((i) => relevantIds.has(i.menuItemId)) : [])
+        .sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0))
+        .slice(0, MAX_ITEMS_PER_RESTAURANT);
+      return { ...restaurant, availabilityStatus: "OPEN", items };
+    })
+    .filter((r) => r.items.length > 0);
+
+  return { restaurants: ranked };
 }
 
 function extractOpenRestaurants(searchResult) {
@@ -113,13 +162,75 @@ function extractOpenRestaurants(searchResult) {
   );
 }
 
+// Single bounded LLM call across ALL restaurants at once (not a per-restaurant
+// loop) — judges which items are genuinely the requested dish using food
+// knowledge, so it correctly keeps creatively-named real matches (see
+// discoverRestaurantsForDish) while still dropping loosely-related fallback
+// items.
+//
+// On any failure (call error, truncated response, malformed JSON) this
+// returns an EMPTY map — i.e. trust nothing — rather than trusting every
+// item. Trusting everything on failure would silently reintroduce the exact
+// bug this function exists to fix (fake matches shown as real), which is a
+// worse failure mode for a price-comparison tool than occasionally showing
+// fewer restaurants than are actually available.
+async function judgeRelevantItems(dish, restaurantsWithItems) {
+  const empty = new Map();
+
+  const payload = restaurantsWithItems.map((r) => ({
+    restaurantId: r.restaurantId,
+    restaurantName: r.restaurantName,
+    items: r.items.map((i) => ({ menuItemId: i.menuItemId, name: i.name })),
+  }));
+
+  try {
+    const completion = await createCompletionWithRetry({
+      model: config.groqModel,
+      reasoning_effort: "low",
+      messages: [
+        {
+          role: "system",
+          content: `You judge whether menu items are genuinely the dish "${dish}", using real-world food knowledge — not literal keyword matching. Creatively or brand-named items (e.g. "The Cluckinator" at a burger restaurant) DO count if they actually are that dish. Exclude items that are a different dish and merely share an ingredient or cuisine (e.g. a chicken biryani is NOT butter chicken). Call report_relevant_items exactly once, covering every restaurant given, even with an empty menuItemIds array if nothing there matches.`,
+        },
+        { role: "user", content: JSON.stringify(payload) },
+      ],
+      tools: [RELEVANCE_TOOL],
+      tool_choice: { type: "function", function: { name: "report_relevant_items" } },
+      max_tokens: 4096,
+    });
+
+    const choice = completion.choices[0];
+    if (choice.finish_reason !== "tool_calls") {
+      console.error(
+        `[judgeRelevantItems] non-terminal finish_reason="${choice.finish_reason}" for dish="${dish}" (${restaurantsWithItems.length} restaurants) — treating as no matches rather than risking a truncated parse.`
+      );
+      return empty;
+    }
+
+    const toolCall = choice.message.tool_calls?.[0];
+    if (!toolCall) {
+      console.error(`[judgeRelevantItems] no tool_call in response for dish="${dish}"`);
+      return empty;
+    }
+
+    const args = JSON.parse(toolCall.function.arguments || "{}");
+    const matches = Array.isArray(args.matches) ? args.matches : [];
+    return new Map(
+      matches.map((m) => [String(m.restaurantId), new Set((m.menuItemIds || []).map(String))])
+    );
+  } catch (err) {
+    console.error(`[judgeRelevantItems] failed for dish="${dish}": ${err.message}`);
+    return empty;
+  }
+}
+
 // Plain-text completion, no tools — just asks for a corrected spelling.
 // reasoning_effort "low" + a real token budget: gpt-oss models spend tokens
 // on a hidden reasoning pass before the answer, and max_tokens=20 (this
 // call's original budget) was entirely consumed by reasoning, leaving the
 // actual content empty with finish_reason "length".
 async function normalizeQuery(dish) {
-  const completion = await groq.chat.completions.create({
+  const completion = await createCompletionWithRetry({
     model: config.groqModel,
     reasoning_effort: "low",
     messages: [
@@ -142,7 +253,7 @@ async function normalizeQuery(dish) {
 async function selectCandidates(dish, candidates) {
   if (candidates.length === 0) return [];
 
-  const completion = await groq.chat.completions.create({
+  const completion = await createCompletionWithRetry({
     model: config.groqModel,
     reasoning_effort: "low",
     messages: [
