@@ -1,0 +1,56 @@
+:root {
+  font: 16px/1.4 system-ui, sans-serif;
+  color-scheme: light dark;
+}
+
+body {
+  margin: 0;
+}
+
+.app-shell {
+  max-width: 800px;
+  margin: 0 auto;
+  padding: 16px;
+}
+
+.panel {
+  border: 1px solid #ccc;
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+
+.error-text {
+  color: #c0392b;
+}
+
+.restaurant-list {
+  list-style: none;
+  padding: 0;
+}
+
+.restaurant-card {
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 8px;
+}
+
+.restaurant-card-main {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.coupon-line.muted {
+  opacity: 0.6;
+}
+
+.effective-price {
+  font-weight: bold;
+}
+
+.savings {
+  color: #27ae60;
+  font-weight: normal;
+}
