@@ -3,21 +3,27 @@ import { api } from "../api.js";
 import { AddressPicker } from "./AddressPicker.jsx";
 import { ReauthNotice, isReauthError } from "./ReauthNotice.jsx";
 
+const VEG_MODES = [
+  { id: "veg", label: "Veg" },
+  { id: "nonveg", label: "Non-veg" },
+  { id: "all", label: "All" },
+];
+
 export function DishCompare() {
   const [hasAddress, setHasAddress] = useState(false);
   const [dish, setDish] = useState("");
+  const [vegMode, setVegMode] = useState("nonveg");
   const [results, setResults] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [reauthError, setReauthError] = useState(null);
 
-  async function search(e) {
-    e.preventDefault();
-    if (!dish.trim()) return;
+  async function runSearch(term, mode) {
+    if (!term.trim()) return;
     setLoading(true);
     setError(null);
     try {
-      const data = await api.compareDish(dish.trim());
+      const data = await api.compareDish(term.trim(), mode);
       setResults(data);
     } catch (err) {
       if (isReauthError(err)) {
@@ -31,6 +37,18 @@ export function DishCompare() {
     }
   }
 
+  function search(e) {
+    e.preventDefault();
+    runSearch(dish, vegMode);
+  }
+
+  function selectVegMode(mode) {
+    setVegMode(mode);
+    // If a search already ran, re-run it immediately with the new filter
+    // instead of leaving stale results on screen under the new label.
+    if (results) runSearch(dish, mode);
+  }
+
   if (reauthError) return <ReauthNotice message={reauthError} />;
 
   return (
@@ -38,11 +56,27 @@ export function DishCompare() {
       <header className="panel-header">
         <h2>Feast Finder</h2>
         <p className="panel-sub">
-          Type a dish and see open restaurants near you, ranked by rating, with non-veg options for
-          that dish and their real coupon price.
+          Type a dish and see open restaurants near you, ranked by rating, with veg or non-veg
+          options for that dish and their real coupon price.
         </p>
       </header>
       <AddressPicker onSelected={() => setHasAddress(true)} />
+
+      <div className="veg-toggle" role="group" aria-label="Veg or non-veg filter">
+        {VEG_MODES.map((m) => (
+          <button
+            key={m.id}
+            type="button"
+            className={`veg-pill veg-pill-${m.id}${vegMode === m.id ? " veg-pill--active" : ""}`}
+            aria-pressed={vegMode === m.id}
+            onClick={() => selectVegMode(m.id)}
+            disabled={loading}
+          >
+            {m.id !== "all" && <span className={`veg-dot veg-dot-${m.id}`} aria-hidden="true" />}
+            {m.label}
+          </button>
+        ))}
+      </div>
 
       <form className="search-row" onSubmit={search}>
         <input
@@ -129,10 +163,21 @@ function ItemRow({ item, dish, restaurantId, restaurantName }) {
 
       <div className="item-details">
         <div className="item-row-main">
+          <span
+            className={`veg-dot ${item.isVeg ? "veg-dot-veg" : "veg-dot-nonveg"}`}
+            title={item.isVeg ? "Veg" : "Non-veg"}
+            aria-label={item.isVeg ? "Veg" : "Non-veg"}
+          />
           <span className="item-name">{item.name}</span>
           {item.rating !== null && <span className="item-rating">★ {item.rating}</span>}
           <span className="item-price">₹{item.price}</span>
         </div>
+
+        {item.estimatedProteinGrams !== null && item.estimatedKcal !== null && (
+          <div className="item-nutrition">
+            Est. ~{item.estimatedProteinGrams}g protein · ~{item.estimatedKcal} kcal
+          </div>
+        )}
 
         {!coupon && (
           <button className="deal-button" onClick={checkDeal} disabled={checking} type="button">

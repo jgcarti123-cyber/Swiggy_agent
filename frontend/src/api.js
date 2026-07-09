@@ -32,7 +32,8 @@ export const api = {
   getSavedAddress: () => request("/api/food/address"),
   saveAddress: (addressId, label, raw) =>
     request("/api/food/address", { method: "POST", body: JSON.stringify({ addressId, label, raw }) }),
-  compareDish: (dish) => request(`/api/food/compare?dish=${encodeURIComponent(dish)}`),
+  compareDish: (dish, vegMode = "nonveg") =>
+    request(`/api/food/compare?dish=${encodeURIComponent(dish)}&vegMode=${encodeURIComponent(vegMode)}`),
   couponCheck: (restaurantId, menuItemId, dish, restaurantName) =>
     request("/api/food/coupon-check", {
       method: "POST",

@@ -27,10 +27,20 @@ foodRouter.get("/address", (req, res) => {
   res.json(getSavedAddress());
 });
 
+const VEG_MODES = new Set(["veg", "nonveg", "all"]);
+
 foodRouter.get("/compare", async (req, res) => {
   const dish = String(req.query.dish || "").trim();
   if (!dish) {
     res.status(400).json({ error: "VALIDATION_ERROR", message: "dish query is required" });
+    return;
+  }
+
+  const vegMode = String(req.query.vegMode || "nonveg").trim();
+  if (!VEG_MODES.has(vegMode)) {
+    res
+      .status(400)
+      .json({ error: "VALIDATION_ERROR", message: "vegMode must be one of veg, nonveg, all" });
     return;
   }
 
@@ -48,12 +58,12 @@ foodRouter.get("/compare", async (req, res) => {
   // tried. search_restaurants + scoped search_menu both work, so an agent
   // drives that path with judgment about which restaurants are worth
   // checking, rather than brute-force scanning every result. discoveryAgent
-  // also filters to non-veg items only and caps each restaurant at 6,
+  // also applies the chosen veg filter and caps each restaurant at 6 items,
   // ranked by item rating.
-  const discovery = await discoverRestaurantsForDish({ dish, addressId: saved.address_id });
+  const discovery = await discoverRestaurantsForDish({ dish, addressId: saved.address_id, vegMode });
 
   if (discovery.restaurants.length === 0) {
-    res.json({ dish, addressId: saved.address_id, restaurants: [] });
+    res.json({ dish, addressId: saved.address_id, vegMode, restaurants: [] });
     return;
   }
 
@@ -69,7 +79,7 @@ foodRouter.get("/compare", async (req, res) => {
     return (a.distanceKm ?? Infinity) - (b.distanceKm ?? Infinity);
   });
 
-  res.json({ dish, addressId: saved.address_id, restaurants: ranked });
+  res.json({ dish, addressId: saved.address_id, vegMode, restaurants: ranked });
 });
 
 // On-demand best-coupon lookup for one specific menu item. Builds a

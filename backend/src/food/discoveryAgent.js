@@ -57,6 +57,33 @@ const RELEVANCE_TOOL = {
   },
 };
 
+const NUTRITION_TOOL = {
+  type: "function",
+  function: {
+    name: "report_nutrition_estimates",
+    description:
+      "Report a rough nutrition estimate for each menu item, based on the dish name and typical restaurant portion sizes. These are approximations, not verified values.",
+    parameters: {
+      type: "object",
+      properties: {
+        estimates: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              menuItemId: { type: "string" },
+              proteinGrams: { type: "number", description: "Estimated grams of protein, whole number" },
+              kcal: { type: "number", description: "Estimated calories, whole number" },
+            },
+            required: ["menuItemId", "proteinGrams", "kcal"],
+          },
+        },
+      },
+      required: ["estimates"],
+    },
+  },
+};
+
 // A first pass here (search_restaurants unscoped, then a growing sequential
 // tool-calling loop checking one candidate at a time via search_menu) worked
 // but took 2.5-5 minutes: each loop turn re-sends the whole accumulating
@@ -65,7 +92,13 @@ const RELEVANCE_TOOL = {
 // to. Splitting into one bounded LLM call (candidate selection) plus
 // parallel deterministic search_menu checks (no LLM in that loop at all)
 // avoids both problems.
-export async function discoverRestaurantsForDish({ dish, addressId }) {
+// vegMode: "veg" | "nonveg" | "all". search_menu's own vegFilter param (see
+// foodClient.searchMenu) only supports veg-only (1) or mixed (0/omitted) —
+// per the live docs there is explicitly NO non-veg-only filter on the tool
+// itself. So "veg" uses the native filter (cheaper — Swiggy excludes non-veg
+// server-side), while "nonveg" fetches mixed results and filters client-side;
+// "all" fetches mixed and keeps everything.
+export async function discoverRestaurantsForDish({ dish, addressId, vegMode = "nonveg" }) {
   let searchResult = await foodClient.searchRestaurants({ addressId, query: dish });
   let openRestaurants = extractOpenRestaurants(searchResult);
 
@@ -97,16 +130,19 @@ export async function discoverRestaurantsForDish({ dish, addressId }) {
       addressId,
       query: dish,
       restaurantIdOfAddedItem: restaurantId,
+      // Native veg-only filter when available; "nonveg" and "all" both need
+      // mixed results (see vegMode comment above).
+      ...(vegMode === "veg" ? { vegFilter: 1 } : {}),
     });
-    const items = Array.isArray(menuResult?.items) ? menuResult.items : [];
+    const rawItems = Array.isArray(menuResult?.items) ? menuResult.items : [];
+    const withId = rawItems.filter((item) => item.menu_item_id);
 
-    // Non-veg only, per user preference. search_menu's vegFilter param only
-    // supports veg-only (1) or mixed (0/omitted) — there's no non-veg-only
-    // filter on the tool itself, so this filters client-side. isVeg/veg is
-    // only present (truthy) on veg items in samples seen; its absence is
-    // treated as non-veg.
-    const nonVegItems = items.filter((item) => item.menu_item_id && !item.isVeg && !item.veg);
-    if (nonVegItems.length === 0) return null;
+    // isVeg/veg is only present (truthy) on veg items in samples seen; its
+    // absence is treated as non-veg. "veg" mode already got a veg-only
+    // result from the tool itself, so no client-side filter needed there.
+    const filtered =
+      vegMode === "nonveg" ? withId.filter((item) => !item.isVeg && !item.veg) : withId;
+    if (filtered.length === 0) return null;
 
     const meta = metaById.get(String(restaurantId));
     return {
@@ -115,11 +151,12 @@ export async function discoverRestaurantsForDish({ dish, addressId }) {
       distanceKm: meta?.distanceKm,
       deliveryTimeMinutes: meta?.deliveryTimeMinutes,
       rating: meta?.avgRating,
-      items: nonVegItems.map((item) => ({
+      items: filtered.map((item) => ({
         menuItemId: String(item.menu_item_id),
         name: item.name,
         price: item.price,
         rating: item.rating ? Number(item.rating) : null,
+        isVeg: Boolean(item.isVeg || item.veg),
         // Swiggy only returns a photo for some items within a restaurant
         // (often under half) — no fallback substitution, the frontend shows
         // an explicit "no photo available" placeholder for the rest.
@@ -152,6 +189,21 @@ export async function discoverRestaurantsForDish({ dish, addressId }) {
       return { ...restaurant, availabilityStatus: "OPEN", items };
     })
     .filter((r) => r.items.length > 0);
+
+  // Nutrition estimation runs on the final displayed set only (post
+  // relevance-filter, post top-6 slice), not the raw up-to-100 candidates —
+  // keeps this call's payload small, which matters given Groq's free-tier
+  // per-request token ceiling (see judgeRelevantItems for the 413 this
+  // caused when a call's budget got too large).
+  const allItems = ranked.flatMap((r) => r.items);
+  const nutritionByItemId = await estimateNutrition(allItems);
+  for (const restaurant of ranked) {
+    for (const item of restaurant.items) {
+      const est = nutritionByItemId.get(item.menuItemId);
+      item.estimatedProteinGrams = est?.proteinGrams ?? null;
+      item.estimatedKcal = est?.kcal ?? null;
+    }
+  }
 
   return { restaurants: ranked };
 }
@@ -221,6 +273,58 @@ async function judgeRelevantItems(dish, restaurantsWithItems) {
   } catch (err) {
     console.error(`[judgeRelevantItems] failed for dish="${dish}": ${err.message}`);
     return empty;
+  }
+}
+
+// Swiggy's MCP tools never return real nutrition data (verified live across
+// several restaurants/dishes — no description or nutrition field exists on
+// search_menu items), so this is a plain LLM guess from the dish name, not a
+// verified value. The frontend must label it as an estimate. On any failure
+// this returns an empty map (no estimate shown) rather than fabricating a
+// fallback number.
+async function estimateNutrition(items) {
+  if (items.length === 0) return new Map();
+
+  try {
+    const completion = await createCompletionWithRetry({
+      model: config.groqModel,
+      reasoning_effort: "low",
+      messages: [
+        {
+          role: "system",
+          content:
+            "You estimate rough nutrition for restaurant dishes from their name alone, assuming a typical single-serving restaurant portion. These are ballpark approximations, not lab-verified values — give your best real-world estimate rather than refusing. Call report_nutrition_estimates exactly once, covering every item given.",
+        },
+        {
+          role: "user",
+          content: JSON.stringify(items.map((i) => ({ menuItemId: i.menuItemId, name: i.name }))),
+        },
+      ],
+      tools: [NUTRITION_TOOL],
+      tool_choice: { type: "function", function: { name: "report_nutrition_estimates" } },
+      max_tokens: 4096,
+    });
+
+    const choice = completion.choices[0];
+    if (choice.finish_reason !== "tool_calls") {
+      console.error(`[estimateNutrition] non-terminal finish_reason="${choice.finish_reason}"`);
+      return new Map();
+    }
+
+    const toolCall = choice.message.tool_calls?.[0];
+    if (!toolCall) return new Map();
+
+    const args = JSON.parse(toolCall.function.arguments || "{}");
+    const estimates = Array.isArray(args.estimates) ? args.estimates : [];
+    return new Map(
+      estimates.map((e) => [
+        String(e.menuItemId),
+        { proteinGrams: Math.round(Number(e.proteinGrams)), kcal: Math.round(Number(e.kcal)) },
+      ])
+    );
+  } catch (err) {
+    console.error(`[estimateNutrition] failed: ${err.message}`);
+    return new Map();
   }
 }
 

@@ -27,6 +27,8 @@
   --green: #48c479;
   --green-dark: #3d9d63;
   --red: #d0392b;
+  --nonveg: #a5442a;
+  --nonveg-tint: #fbeee9;
 
   --shadow-sm: 0 1px 3px rgba(40, 44, 63, 0.08);
   --shadow-md: 0 4px 16px rgba(40, 44, 63, 0.1);
@@ -446,6 +448,80 @@ button:disabled {
   text-align: left;
 }
 
+/* ------------------------------------------------------------- veg toggle */
+
+.veg-toggle {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.veg-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  background: var(--bg-subtle);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 7px 15px;
+  font-size: 0.86rem;
+  font-weight: 600;
+}
+
+.veg-pill:hover:not(:disabled):not(.veg-pill--active) {
+  border-color: var(--border-strong);
+}
+
+.veg-pill--active.veg-pill-veg {
+  background: #eafaf0;
+  border-color: var(--green-dark);
+  color: var(--green-dark);
+}
+
+.veg-pill--active.veg-pill-nonveg {
+  background: var(--nonveg-tint);
+  border-color: var(--nonveg);
+  color: var(--nonveg);
+}
+
+.veg-pill--active.veg-pill-all {
+  background: var(--orange-tint);
+  border-color: var(--orange);
+  color: var(--orange-dark);
+}
+
+/* Small square + dot, the common veg/non-veg indicator convention. */
+.veg-dot {
+  position: relative;
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+  border: 1.5px solid var(--green-dark);
+  border-radius: 3px;
+}
+
+.veg-dot::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--green-dark);
+  transform: translate(-50%, -50%);
+}
+
+.veg-dot-nonveg {
+  border-color: var(--nonveg);
+}
+
+.veg-dot-nonveg::after {
+  background: var(--nonveg);
+}
+
 /* --------------------------------------------------------------- search row */
 
 .search-row {
@@ -595,6 +671,15 @@ button:disabled {
   margin-left: auto;
   font-weight: 700;
   color: var(--text-dark);
+}
+
+/* LLM-estimated, not verified nutrition data — no such field exists on
+   Swiggy's search_menu response, so this must read as an approximation. */
+.item-nutrition {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--orange-dark);
+  margin-top: 2px;
 }
 
 .deal-button {
