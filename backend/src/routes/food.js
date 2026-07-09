@@ -63,7 +63,13 @@ foodRouter.get("/compare", async (req, res) => {
   const discovery = await discoverRestaurantsForDish({ dish, addressId: saved.address_id, vegMode });
 
   if (discovery.restaurants.length === 0) {
-    res.json({ dish, addressId: saved.address_id, vegMode, restaurants: [] });
+    res.json({
+      dish,
+      addressId: saved.address_id,
+      vegMode,
+      restaurants: [],
+      suggestedTerms: discovery.suggestedTerms || [],
+    });
     return;
   }
 

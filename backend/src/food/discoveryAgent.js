@@ -57,6 +57,26 @@ const RELEVANCE_TOOL = {
   },
 };
 
+const EXPAND_TOOL = {
+  type: "function",
+  function: {
+    name: "suggest_alternative_terms",
+    description:
+      "Suggest BROADER search terms for a dish that found no matching restaurants — the base dish with qualifiers stripped, the cuisine, or the general category — that match how nearby restaurants are actually named or tagged. Broader, never more specific.",
+    parameters: {
+      type: "object",
+      properties: {
+        terms: {
+          type: "array",
+          items: { type: "string" },
+          description: "3-5 broader search terms, most-likely-to-match first",
+        },
+      },
+      required: ["terms"],
+    },
+  },
+};
+
 const NUTRITION_TOOL = {
   type: "function",
   function: {
@@ -115,8 +135,45 @@ export async function discoverRestaurantsForDish({ dish, addressId, vegMode = "n
     }
   }
 
+  // search_restaurants is a name/cuisine-tag text match, not a real dish
+  // search (see the module-level comment on discoverRestaurantsForDish) — it
+  // finds nothing for a dish like "alfaham" unless some nearby restaurant
+  // literally has that word in its name or cuisine tags, even though an
+  // Arabian grill place two streets over genuinely serves it. Ask the model
+  // for synonym/cuisine/related-dish terms and re-search with those before
+  // giving up. These terms are ONLY used to widen the search_restaurants
+  // candidate pool — every step after this still judges against the
+  // original `dish` text, so a loose synonym can only add candidates, never
+  // cause a false match (judgeRelevantItems still has to agree the item is
+  // genuinely the original dish).
+  let suggestedTerms = [];
   if (openRestaurants.length === 0) {
-    return { restaurants: [] };
+    const rawTerms = await expandSearchTerms(dish, vegMode).catch(() => []);
+    if (rawTerms.length > 0) {
+      const expansionResults = await mapWithConcurrency(rawTerms, SEARCH_CONCURRENCY, async (term) => ({
+        term,
+        restaurants: extractOpenRestaurants(
+          await foodClient.searchRestaurants({ addressId, query: term }).catch(() => null)
+        ),
+      }));
+      const merged = new Map();
+      const validated = [];
+      for (const { term, restaurants } of expansionResults) {
+        // Only terms that actually returned open restaurants become
+        // user-facing "try instead" chips — never suggest an alternative that
+        // itself leads to a dead end. A term that found nothing here still
+        // contributed nothing to the candidate pool, so dropping it costs us
+        // nothing either.
+        if (restaurants.length > 0) validated.push(term);
+        for (const r of restaurants) merged.set(String(r.id), r);
+      }
+      suggestedTerms = validated;
+      openRestaurants = [...merged.values()];
+    }
+  }
+
+  if (openRestaurants.length === 0) {
+    return { restaurants: [], suggestedTerms };
   }
 
   const metaById = new Map(openRestaurants.map((r) => [String(r.id), r]));
@@ -166,7 +223,7 @@ export async function discoverRestaurantsForDish({ dish, addressId, vegMode = "n
   });
 
   const withMatches = checked.filter(Boolean);
-  if (withMatches.length === 0) return { restaurants: [] };
+  if (withMatches.length === 0) return { restaurants: [], suggestedTerms };
 
   // A real Swiggy behavior: when a restaurant has no genuine match, scoped
   // search_menu doesn't return an empty list — it falls back to
@@ -205,7 +262,11 @@ export async function discoverRestaurantsForDish({ dish, addressId, vegMode = "n
     }
   }
 
-  return { restaurants: ranked };
+  // suggestedTerms is only non-empty when the initial name/cuisine search
+  // failed and expansion had to run — surfaced here too since expansion
+  // finding candidate restaurants doesn't guarantee any of them survive
+  // relevance judgment (ranked can still legitimately end up empty).
+  return { restaurants: ranked, suggestedTerms: ranked.length === 0 ? suggestedTerms : [] };
 }
 
 function extractOpenRestaurants(searchResult) {
@@ -348,6 +409,54 @@ async function normalizeQuery(dish) {
     max_tokens: 200,
   });
   return completion.choices[0].message.content?.trim().replace(/^["']|["']$/g, "") || null;
+}
+
+// vegMode only biases which synonyms get suggested (no chicken/egg/fish
+// terms while "veg" is active) — it has no effect on search_restaurants
+// itself, which has no veg parameter. On any failure this returns an empty
+// array, same fail-safe posture as the other LLM helpers here: no
+// suggestions rather than fabricated ones.
+async function expandSearchTerms(dish, vegMode) {
+  try {
+    const completion = await createCompletionWithRetry({
+      model: config.groqModel,
+      reasoning_effort: "low",
+      messages: [
+        {
+          role: "system",
+          content: `A search for "${dish}" found no nearby restaurants. This search matches restaurant NAMES and CUISINE TAGS — not full dish names — so specific multi-word dishes (e.g. "chicken pasta", "paneer tikka masala", "chicken alfredo") almost never match on their own. Suggest 3-5 BROADER terms that restaurants are actually named or tagged with, so the search can find restaurants whose menu then gets filtered back down to the original dish. Prefer, in this order: (1) the base dish with qualifiers stripped ("chicken pasta" -> "pasta", "paneer butter masala" -> "paneer"), (2) the cuisine ("italian", "arabian", "north indian"), (3) the broad category ("burger", "biryani"). Do NOT suggest longer or more specific variants of the original dish — go broader, not narrower. Put the single most likely-to-match term first.${
+            vegMode === "veg"
+              ? " The user wants vegetarian results only — do not suggest meat, egg, or fish dishes."
+              : vegMode === "nonveg"
+                ? " The user wants non-vegetarian results — prefer meat/egg/fish-appropriate suggestions."
+                : ""
+          } Call suggest_alternative_terms exactly once.`,
+        },
+        { role: "user", content: dish },
+      ],
+      tools: [EXPAND_TOOL],
+      tool_choice: { type: "function", function: { name: "suggest_alternative_terms" } },
+      max_tokens: 512,
+    });
+
+    const choice = completion.choices[0];
+    if (choice.finish_reason !== "tool_calls") {
+      console.error(`[expandSearchTerms] non-terminal finish_reason="${choice.finish_reason}" for dish="${dish}"`);
+      return [];
+    }
+
+    const toolCall = choice.message.tool_calls?.[0];
+    if (!toolCall) return [];
+
+    const args = JSON.parse(toolCall.function.arguments || "{}");
+    const terms = Array.isArray(args.terms)
+      ? args.terms.filter((t) => typeof t === "string" && t.trim()).map((t) => t.trim())
+      : [];
+    return terms.slice(0, 5);
+  } catch (err) {
+    console.error(`[expandSearchTerms] failed for dish="${dish}": ${err.message}`);
+    return [];
+  }
 }
 
 // Single bounded LLM call — forced to answer via one tool call, so this is

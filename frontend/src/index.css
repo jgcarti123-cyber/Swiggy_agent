@@ -534,6 +534,76 @@ button:disabled {
   flex: 1;
 }
 
+/* .search-row button (below) fills primary buttons orange — these two
+   selectors need to out-specificity that rule for the icon button to keep
+   its secondary (outline) look. */
+.search-row .surprise-button {
+  flex-shrink: 0;
+  width: 46px;
+  height: 46px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  background: var(--bg);
+  color: var(--orange-dark);
+  border: 1px solid var(--orange);
+  box-shadow: none;
+}
+
+.search-row .surprise-button:hover:not(:disabled) {
+  background: var(--orange-tint);
+}
+
+.surprise-button svg {
+  width: 20px;
+  height: 20px;
+}
+
+/* -------------------------------------------------------------- no results */
+
+.no-results {
+  margin-top: 8px;
+  padding: 18px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.no-results > p {
+  color: var(--text);
+  margin: 0;
+}
+
+.suggestion-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.suggestion-label {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.suggestion-chip {
+  background: var(--bg);
+  color: var(--text-dark);
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 0.86rem;
+  font-weight: 600;
+}
+
+.suggestion-chip:hover:not(:disabled) {
+  background: var(--orange-tint);
+  border-color: var(--orange);
+  color: var(--orange-dark);
+}
+
 /* ---------------------------------------------------------- restaurant list */
 
 .restaurant-list {

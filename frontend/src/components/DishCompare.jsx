@@ -2,12 +2,22 @@ import { useState } from "react";
 import { api } from "../api.js";
 import { AddressPicker } from "./AddressPicker.jsx";
 import { ReauthNotice, isReauthError } from "./ReauthNotice.jsx";
+import { DISHES } from "../data/dishes.js";
 
 const VEG_MODES = [
   { id: "veg", label: "Veg" },
   { id: "nonveg", label: "Non-veg" },
   { id: "all", label: "All" },
 ];
+
+// "veg" filter only ever shows veg-tagged items (see DISHES), so the
+// randomiser should only ever suggest dishes that can actually turn up
+// something under the active filter — same reasoning for "nonveg".
+function dishesForVegMode(vegMode) {
+  if (vegMode === "veg") return DISHES.filter((d) => d.tag === "veg" || d.tag === "either");
+  if (vegMode === "nonveg") return DISHES.filter((d) => d.tag === "nonveg" || d.tag === "either");
+  return DISHES;
+}
 
 export function DishCompare() {
   const [hasAddress, setHasAddress] = useState(false);
@@ -49,6 +59,17 @@ export function DishCompare() {
     if (results) runSearch(dish, mode);
   }
 
+  // Fills the box only — does not auto-search — so a pick you don't feel
+  // like eating can just be rerolled or typed over before hitting Compare.
+  function surpriseMe() {
+    const pool = dishesForVegMode(vegMode);
+    const choices = pool.filter((d) => d.name !== dish);
+    const pick = (choices.length > 0 ? choices : pool)[
+      Math.floor(Math.random() * (choices.length > 0 ? choices.length : pool.length))
+    ];
+    if (pick) setDish(pick.name);
+  }
+
   if (reauthError) return <ReauthNotice message={reauthError} />;
 
   return (
@@ -85,6 +106,16 @@ export function DishCompare() {
           placeholder="e.g. biryani, paneer tikka, margherita pizza"
           disabled={!hasAddress}
         />
+        <button
+          type="button"
+          className="surprise-button"
+          onClick={surpriseMe}
+          disabled={!hasAddress}
+          title="Surprise me with a random dish"
+          aria-label="Surprise me with a random dish"
+        >
+          <DiceIcon />
+        </button>
         <button type="submit" disabled={!hasAddress || loading}>
           {loading ? "Searching…" : "Compare"}
         </button>
@@ -93,7 +124,28 @@ export function DishCompare() {
       {error && <p className="error-text">{error}</p>}
 
       {results && results.restaurants.length === 0 && (
-        <p>No open restaurants found serving "{results.dish}" nearby.</p>
+        <div className="no-results">
+          <p>No open restaurants found serving "{results.dish}" nearby.</p>
+          {results.suggestedTerms?.length > 0 && (
+            <div className="suggestion-chips">
+              <span className="suggestion-label">Try instead:</span>
+              {results.suggestedTerms.map((term) => (
+                <button
+                  key={term}
+                  type="button"
+                  className="suggestion-chip"
+                  onClick={() => {
+                    setDish(term);
+                    runSearch(term, vegMode);
+                  }}
+                  disabled={loading}
+                >
+                  {term}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
       )}
 
       {results && results.restaurants.length > 0 && (
@@ -104,6 +156,19 @@ export function DishCompare() {
         </ul>
       )}
     </section>
+  );
+}
+
+function DiceIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect x="3" y="3" width="18" height="18" rx="4" />
+      <circle cx="8" cy="8" r="1.2" fill="currentColor" stroke="none" />
+      <circle cx="16" cy="8" r="1.2" fill="currentColor" stroke="none" />
+      <circle cx="12" cy="12" r="1.2" fill="currentColor" stroke="none" />
+      <circle cx="8" cy="16" r="1.2" fill="currentColor" stroke="none" />
+      <circle cx="16" cy="16" r="1.2" fill="currentColor" stroke="none" />
+    </svg>
   );
 }
 
