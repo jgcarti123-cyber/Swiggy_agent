@@ -28,6 +28,10 @@ instamartRouter.post("/chat/reset", (req, res) => {
 
 instamartRouter.post("/chat", async (req, res) => {
   const message = String(req.body?.message || "").trim();
+  // Optional: an "intent" string sent to the LLM instead of the visible
+  // message — e.g. an Add-button click shows a clean label but sends the exact
+  // spinId/skuId to the model so it adds the right variant without guessing.
+  const intent = String(req.body?.intent || "").trim();
   if (!message) {
     res.status(400).json({ error: "VALIDATION_ERROR", message: "message is required" });
     return;
@@ -40,6 +44,6 @@ instamartRouter.post("/chat", async (req, res) => {
     res.status(400).json({ error: "NO_ADDRESS", message: "Select a delivery address first." });
     return;
   }
-  const result = await sendMessage(message, saved.address_id);
+  const result = await sendMessage(intent || message, saved.address_id, message);
   res.json(result);
 });

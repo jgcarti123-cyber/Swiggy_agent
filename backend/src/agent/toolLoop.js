@@ -4,17 +4,20 @@ import { config } from "../config.js";
 // Groq has no server-side tool execution like Anthropic's beta MCP
 // connector — every tool_call the model emits has to be executed here and
 // fed back as a `role: "tool"` message before asking the model to continue.
-// This loop is shared by the food-discovery agent (one-shot, ends when a
-// designated `finalToolName` is called) and the Instamart chat agent
-// (multi-turn, ends when the model replies with no tool_calls).
+// The loop ends either when the model replies with no tool_calls, or when it
+// calls one of `finalToolNames` — a "turn-ending" tool whose args are handed
+// back to the caller to act on (e.g. the Instamart agent's ask_choice /
+// present_products, which render UI rather than feed a result back to the
+// model).
 export async function runToolLoop({
   messages,
   tools,
   executeTool,
-  finalToolName,
+  finalToolNames = [],
   maxIterations = 12,
   maxTokens = 4096,
 }) {
+  const finalSet = new Set(Array.isArray(finalToolNames) ? finalToolNames : [finalToolNames].filter(Boolean));
   const executedTools = [];
 
   for (let i = 0; i < maxIterations; i++) {
@@ -37,10 +40,11 @@ export async function runToolLoop({
       `[toolLoop] iter=${i} completion=${completionMs}ms toolCalls=${toolCalls.length} names=${toolCalls.map((t) => t.function.name).join(",")}`
     );
     if (toolCalls.length === 0) {
-      return { text: message.content || "", finalArgs: null, executedTools };
+      return { text: message.content || "", finalArgs: null, finalToolName: null, executedTools };
     }
 
     let finalArgs = null;
+    let finalToolName = null;
 
     // Tool calls batched into one turn are independent — run them
     // concurrently instead of serializing network round-trips to Swiggy.
@@ -55,7 +59,7 @@ export async function runToolLoop({
     const settled = await Promise.all(
       parsed.map(async (p) => {
         if (p.parseError) return p;
-        if (finalToolName && p.toolCall.function.name === finalToolName) {
+        if (finalSet.has(p.toolCall.function.name)) {
           return { ...p, isFinal: true };
         }
         try {
@@ -76,15 +80,27 @@ export async function runToolLoop({
         continue;
       }
       if (s.isFinal) {
-        finalArgs = s.args;
-        continue; // ending the loop — no tool result needed for this one
+        // Only the first final tool in a batch wins.
+        if (finalArgs === null) {
+          finalArgs = s.args;
+          finalToolName = s.toolCall.function.name;
+        }
+        // Still push a tool result so the assistant tool_call isn't left
+        // dangling — the conversation is reused on the next turn, and the Groq
+        // API rejects a tool_call with no matching tool response.
+        messages.push({
+          role: "tool",
+          tool_call_id: s.toolCall.id,
+          content: JSON.stringify({ ok: true, deliveredToUser: true }),
+        });
+        continue;
       }
       executedTools.push({ name: s.toolCall.function.name, args: s.args });
       messages.push({ role: "tool", tool_call_id: s.toolCall.id, content: JSON.stringify(s.result ?? null) });
     }
 
     if (finalArgs !== null) {
-      return { text: message.content || "", finalArgs, executedTools };
+      return { text: message.content || "", finalArgs, finalToolName, executedTools };
     }
   }
 

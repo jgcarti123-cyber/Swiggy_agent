@@ -45,8 +45,11 @@ export const api = {
 
   instamartCart: () => request("/api/instamart/cart"),
   instamartChatHistory: () => request("/api/instamart/chat/history"),
-  instamartChatSend: (message) =>
-    request("/api/instamart/chat", { method: "POST", body: JSON.stringify({ message }) }),
+  instamartChatSend: (message, intent) =>
+    request("/api/instamart/chat", {
+      method: "POST",
+      body: JSON.stringify(intent ? { message, intent } : { message }),
+    }),
   instamartChatReset: () => request("/api/instamart/chat/reset", { method: "POST" }),
 };
 
