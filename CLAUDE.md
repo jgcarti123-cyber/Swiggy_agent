@@ -2,16 +2,20 @@
 
 ## Project
 
-A personal, single-user, local-only web dashboard built on the official Swiggy Builders Club MCP servers. One page, two panels:
+A personal, single-user, local-only web dashboard built on the official Swiggy Builders Club MCP servers. One page, a sidebar, two panels:
 
-1. **Food dish compare** — type a dish, see nearby open restaurants that serve it, ranked by price after the best available coupon.
-2. **Instamart order chat** — a chat box where free-text messages ("add milk and bananas") are turned into Instamart search/cart/checkout actions by an LLM agent, with a live cart panel that always reflects the real cart state.
+1. **Feast Finder** (food dish compare) — type a dish, see nearby open restaurants that serve it, ranked by rating (distance as tiebreak), with a veg/non-veg/all filter, up to 6 matching items per restaurant with photos and LLM-estimated nutrition, and an on-demand real coupon price per item.
+2. **Pantry Pal** (Instamart order chat) — a chat box where free-text messages ("add milk") are turned into Instamart search/cart/checkout actions, with a live cart panel that always reflects the real cart state. Broad requests get a guided brand → variant picker (with photos and a quantity stepper); most of that flow is **deterministic, not LLM-driven** — see "Pantry Pal's real architecture" below before touching it.
 
 Runs on `localhost` only. Single user (the account owner). No multi-tenant auth, no public deployment, no Telegram bot, no Dineout — those are separate projects and explicitly out of scope here.
+
+For the full "why is the code shaped this way" narrative — every verified Swiggy tool quirk, every Groq rate-limit incident, the full Pantry Pal architecture with measured before/after numbers — see **`ARCHITECTURE.md`**. This file is the quick-reference brief; that one is the detailed record.
 
 ## Absolute rule: no hallucinated Swiggy tools or parameters
 
 Before implementing any call to a Swiggy MCP tool, fetch and read the corresponding doc below. Never invent a tool name, parameter, error code, or auth detail. If a doc doesn't cover something you need, stop and ask rather than guessing — Swiggy's own agent-authoring guidance is explicit about this.
+
+This isn't theoretical: several things in the docs below turned out not to match the live server (see the "Verified to NOT work as documented" callouts) — they were only caught because the actual tool responses were inspected live, not assumed from the doc text. Docs describe intended behavior; the running server is the source of truth.
 
 - Index of every doc: https://mcp.swiggy.com/builders/llms.txt
 - Full text (only if you need broad context in one shot): https://mcp.swiggy.com/builders/llms-full.txt
@@ -36,51 +40,65 @@ Before implementing any call to a Swiggy MCP tool, fetch and read the correspond
 
 They are independent: no shared carts, orders, or sessions between servers.
 
-## Tools this project needs (fetch each `.md` before using)
+## Tools this project actually calls (fetch each `.md` before touching)
 
-**Food**
+**Food** — all called from `backend/src/mcp/foodClient.js`:
 - `get_addresses` — https://mcp.swiggy.com/builders/docs/reference/food/get_addresses.md
-- `search_menu` — https://mcp.swiggy.com/builders/docs/reference/food/search_menu.md — dish-level search. Confirmed from the docs: when called **without** `restaurantIdOfAddedItem`, it searches across restaurants near the address. This is the "find restaurants serving X dish" capability — do not build manual per-restaurant menu scanning.
-- `search_restaurants` — https://mcp.swiggy.com/builders/docs/reference/food/search_restaurants.md — restaurant/cuisine name search only, not dish search. Not part of the dish-compare flow.
-- `get_restaurant_menu` — https://mcp.swiggy.com/builders/docs/reference/food/get_restaurant_menu.md
-- `fetch_food_coupons` — https://mcp.swiggy.com/builders/docs/reference/food/fetch_food_coupons.md — read-only, needs only `restaurantId` + `addressId`, no active cart required. Use this to estimate price-after-coupon across all candidate restaurants in parallel.
-- `apply_food_coupon` — https://mcp.swiggy.com/builders/docs/reference/food/apply_food_coupon.md — only call once the user has actually chosen a restaurant and added items, to get the exact confirmed total.
-- `update_food_cart` — https://mcp.swiggy.com/builders/docs/reference/food/update_food_cart.md
-- `get_food_cart` — https://mcp.swiggy.com/builders/docs/reference/food/get_food_cart.md
-- `place_food_order` — https://mcp.swiggy.com/builders/docs/reference/food/place_food_order.md
-- `track_food_order` — https://mcp.swiggy.com/builders/docs/reference/food/track_food_order.md
-- `flush_food_cart` — https://mcp.swiggy.com/builders/docs/reference/food/flush_food_cart.md
-- `report_error` — https://mcp.swiggy.com/builders/docs/reference/food/report_error.md
+- `search_restaurants` — https://mcp.swiggy.com/builders/docs/reference/food/search_restaurants.md — restaurant/cuisine **name** search, not dish search. This is the real entry point for Feast Finder (see below), not `search_menu` unscoped.
+- `search_menu` — https://mcp.swiggy.com/builders/docs/reference/food/search_menu.md — dish-level search, called **scoped** (`restaurantIdOfAddedItem` set) per candidate restaurant. **Verified to NOT work as documented when called unscoped**: the doc describes omitting `restaurantIdOfAddedItem` as searching across restaurants near an address — live testing across many dishes/addresses on the current beta returns zero results every time. Do not build around unscoped `search_menu`; it doesn't work right now, however the doc reads. `vegFilter` on this tool only supports veg-only (`1`) or mixed (`0`/omitted) — there is no non-veg-only value.
+- `get_restaurant_menu` — https://mcp.swiggy.com/builders/docs/reference/food/get_restaurant_menu.md — unused in the current flow (kept as a typed wrapper); has a real Swiggy-authored `description` field that `search_menu` items lack, if nutrition/allergen text is ever wired in properly.
+- `fetch_food_coupons` / `apply_food_coupon` — https://mcp.swiggy.com/builders/docs/reference/food/fetch_food_coupons.md — **Verified to NOT work as documented**: `fetch_food_coupons` returns a bare `{}` regardless of cart/coupon state on the live beta, so it cannot be used for parallel no-cart price estimation as originally planned. The only way to see a real coupon price is to build an actual cart and read the auto-applied offer (see `couponCheck.js`), then `apply_food_coupon` it explicitly (auto-suggestion alone reports `discount: 0` until applied).
+- `update_food_cart`, `get_food_cart`, `place_food_order`, `track_food_order`, `flush_food_cart`, `report_error` — used as documented, all cart-touching ones gated behind an explicit user click.
 
-**Instamart**
-- `get_addresses` — https://mcp.swiggy.com/builders/docs/reference/instamart/get_addresses.md
-- `search_products` — https://mcp.swiggy.com/builders/docs/reference/instamart/search_products.md
-- `update_cart` — https://mcp.swiggy.com/builders/docs/reference/instamart/update_cart.md — **replaces the entire cart**, it is not additive. Read this doc carefully before wiring the chat agent's cart-update calls.
-- `get_cart` — https://mcp.swiggy.com/builders/docs/reference/instamart/get_cart.md
-- `checkout` — https://mcp.swiggy.com/builders/docs/reference/instamart/checkout.md — creates the order and confirms payment in one call. Only trigger this on an explicit user confirmation.
-- `clear_cart` — https://mcp.swiggy.com/builders/docs/reference/instamart/clear_cart.md
-- `your_go_to_items` — https://mcp.swiggy.com/builders/docs/reference/instamart/your_go_to_items.md
-- `get_orders`, `get_order_details`, `track_order`, `create_address`, `delete_address`, `report_error` — see the reference index above for each
+**Instamart** — all called from `backend/src/mcp/instamartClient.js`:
+- `get_addresses` — used only by the `/api/instamart/addresses` route (the address picker UI), never by the chat agent.
+- `search_products` — returns `products[]`, each with `brand` and a `variations[]` array (`spinId`, `skuId`, `quantityDescription`, `price.mrp`/`price.offerPrice`, `imageUrl`, `isInStockAndAvailable`). Confirmed live: Swiggy freely mixes out-of-stock variants into results with no separate flag needed beyond `isInStockAndAvailable` — the app must not assume everything returned is buyable.
+- `update_cart` — https://mcp.swiggy.com/builders/docs/reference/instamart/update_cart.md — **replaces the entire cart**, not additive; every caller reads `get_cart` first and sends back the full merged list. Also confirmed live: rejects an **empty** items array outright ("items array is required and must contain at least one item") — removing the last item in the cart has to go through `clear_cart` instead, never `update_cart` with `items: []`.
+- `get_cart` — returns `items[]` (with `spinId`, `skuId`, `itemName`, `quantity`, `mrp`, `discountedFinalPrice`, `imageUrl`), `cartTotalAmount`, `billBreakdown`, plus a large `selectedAddressDetails` block the app doesn't need. When there's no active cart it throws a tool error ("Cart not found or session expired...") rather than returning an empty list — treated as a normal empty cart everywhere in this app, not surfaced as an error.
+- `clear_cart` — idempotent in effect; used both for the "Clear cart" action and as the fallback when a mutation would otherwise leave `items: []`.
+- `your_go_to_items` — same `products[]`/`variations[]` shape as `search_products`, used for "Reorder my usuals."
+- `checkout`, `get_payment_options` — only reachable after explicit user confirmation in chat; never retried automatically (see Pantry Pal section below — retrying a payment call could double-order).
+- `get_orders`, `get_order_details`, `track_order`, `create_address`, `delete_address`, `report_error` — see the reference index; not currently wired into either feature.
 
 ## Auth
 
 OAuth 2.1 + PKCE with phone + OTP in the browser, per https://mcp.swiggy.com/builders/docs/start/authenticate.md. Dynamic Client Registration (RFC 7591) means there's no client_id to apply for manually during local dev — the MCP client library handles it. Access tokens last 5 days; **there is no refresh token in v1** — treat every 401 as "re-run the authorization flow," not as a bug to patch around. Store the token server-side only, never in frontend code or browser storage. Build against `http://localhost` redirect URIs first — no approval needed for this stage; production access is a separate, later step (see Access & onboarding doc above).
 
-## Feature 1: Food dish compare
+Separately from token expiry: the backend keeps one cached, connected MCP client per server URL for the life of the process. That connection itself can go stale independently of the token (confirmed live — a long-running cached connection kept failing with a raw "fetch failed" network error while a brand-new connection to the identical server succeeded instantly). `mcpClient.js` now drops the cached connection on network-level failures, not just 401s, so the next call reconnects instead of repeating the same dead connection's failure.
 
-Flow: user types a dish → call `search_menu` with the saved `addressId` and the dish as `query`, omitting `restaurantIdOfAddedItem` so it searches across restaurants → group results by restaurant, filter out anything not `availabilityStatus: OPEN` → for each distinct restaurant found, call `fetch_food_coupons` in parallel (read-only, no cart needed) → compute an estimated best price per restaurant from the coupon terms and amounts → render a ranked list: restaurant name, dish + base price, best coupon, estimated effective price, rating, distance/ETA, sorted cheapest-effective-price first. Only touch the cart (`update_food_cart`, `apply_food_coupon`) once the user clicks to actually order from a specific restaurant, to get the exact confirmed total before `place_food_order`.
+## Feature 1: Feast Finder
 
-## Feature 2: Instamart chat
+Real flow (do **not** rebuild around unscoped `search_menu` — see above, it doesn't work):
 
-A chat panel where the user's free-text messages go to Claude via Anthropic's SDK, using its native MCP connector with the Instamart server's tools attached directly — the model decides which tool to call (search, cart update, checkout) from the conversation. After every tool call that touches the cart, re-fetch `get_cart` server-side and render the live cart summary from that response, not from the model's text description alone.
+1. `search_restaurants(dish)` → filter to `availabilityStatus: "OPEN"`. If zero results, ask an LLM to normalize spelling and retry once.
+2. If still zero, ask an LLM for **broader** search terms (base dish with qualifiers stripped, cuisine, category — never narrower) and re-search with each in parallel; only terms that actually returned restaurants become "try instead" chips shown to the user.
+3. One bounded LLM call picks up to 10 plausible candidate restaurants from name + cuisine tags.
+4. Scoped `search_menu(dish, restaurantId)` per candidate, in parallel (4 at a time) — `vegFilter: 1` when the user's filter is "veg" (native, cheaper); "nonveg" and "all" fetch mixed results, with "nonveg" filtered client-side (`!item.isVeg && !item.veg`) since the tool has no non-veg-only mode.
+5. One bounded LLM call judges, across all restaurants' surviving items at once, which are *genuinely* the requested dish (real food knowledge, not keyword matching — needed because scoped `search_menu` falls back to loosely-related items instead of an empty list when a restaurant has no real match).
+6. Sort each restaurant's surviving items by rating, keep top 6.
+7. One bounded LLM call estimates protein/kcal for the final displayed item set — **a guess from the dish name, not real data**; Swiggy's tools have no nutrition field. Label it as an estimate in the UI.
+8. Sort restaurants by rating desc, distance asc. Only touch the cart (`update_food_cart`, `apply_food_coupon`) once the user clicks to actually order.
 
-## UI: match Swiggy's visual language
+Also on the Feast Finder screen: a veg/non-veg/all pill toggle, and a "surprise me" dice button that fills the search box from a curated, veg/nonveg-tagged dish list (`frontend/src/data/dishes.js`) respecting the active filter — client-side only, no backend call.
 
-Reference: https://www.swiggy.com — for layout and style direction only, not for copying their logo or other trademarked assets. Direction: Swiggy's signature orange (roughly `#FC8019`) as the primary accent for buttons and active states; near-black (roughly `#282C3F`) for headings and primary text; white or very light gray (`#F8F8F8`-ish) card backgrounds; generously rounded corners (10–16px) on cards and buttons; bold, confident sans-serif type; pill-shaped filter/category chips; a filled green rating badge with a star icon; delivery time shown as a small muted badge next to price. These hex values are from general knowledge of the brand, not pixel-sampled from the live site programmatically — inspect the real site (devtools or a screenshot) before locking in final design tokens. Do not use Swiggy's actual logo, wordmark, or other copyrighted imagery; use an original wordmark/icon in the same color language.
+## Feature 2: Pantry Pal
+
+**Read this before changing anything in `backend/src/agent/instamartAgent.js`.** The chat agent is deliberately **not** a pure "every message goes to the LLM, which decides everything" loop anymore — it was, and it was unusably slow (measured 7 Groq completions / ~129s for one guided add). Most of the guided-search and cart-mutation flow is now **deterministic code**, not model judgment:
+
+- `search_products` is the only thing the model calls to find products. What happens next — ask which brand (only when 2+ brands are found, each option **verified to have an in-stock variant**), or show variants (sorted in-stock-first, then price ascending, in a code-decided branch, not a second model completion) — is decided in `runSearchAndBranch()` immediately after the search runs, via a `__endLoop` sentinel `executeTool` can return to end the tool loop without another completion.
+- Naming a previously-offered brand, picking the "Any brand" option, clicking "Add" on a product card, "Show more", "Reorder my usuals", "Clear cart", and the cart's +/- quantity stepper are **all zero-LLM direct actions** (`addItemDirect`, `showMoreDirect`, `clearCartDirect`, `reorderUsualsDirect`, `setItemQuantity`) — plain `get_cart` → merge → `update_cart` in code. The model is only ever invoked to turn genuinely free-text requests into a search query, or to handle free-text cart edits ("remove the bread") that need real reasoning about current cart contents.
+- The delivery address is resolved server-side from the saved address and injected into every tool call — the model never sees or asks for one. `get_addresses`/`get_orders`/`track_order` are not in the model's tool list at all.
+- Product photos never reach the model (stripped for tokens) — a server-side cache keyed by `spinId` holds the full variant data from search results, and card-rendering joins photos/prices back by id. `get_cart` already returns `imageUrl` per line item directly, so the cart doesn't need this cache.
+- `update_cart`/`clear_cart` retry once automatically on failure (both idempotent — replaying the same payload is safe) and drop the cached MCP connection on a network-level failure first (see Auth section) so the retry gets a fresh connection. **Never add this kind of automatic retry to `checkout`/`confirm_order`** — those aren't idempotent, and retrying one blindly could create a duplicate order.
+- Some Instamart items report as fully in-stock in search yet still get rejected by `update_cart` unpredictably (confirmed live, not something the search response can predict) — these fail with a short actionable message, never a raw multi-line dump, and never cascade into blocking the next add.
+
+## UI: Swiggy visual language (already implemented, not just aspirational)
+
+The app already uses Swiggy's signature orange (`#FC8019`) as the primary accent, near-black (`#282C3F`) headings, white/light-gray card backgrounds, generously rounded corners, Poppins type, pill-shaped filter chips, a filled green rating badge, and a small muted delivery-time badge — see `frontend/src/index.css`. A sidebar (`Sidebar.jsx`) switches between the two panels; both stay mounted (`hidden` attribute) so switching tabs never loses in-progress state. An original wordmark/icon is used throughout — Swiggy's actual logo is never reproduced. When adding new UI, match this existing system rather than introducing new tokens.
 
 ## Stack
 
-React + Vite frontend, Node/Express backend, SQLite for local state (saved address id, cached menu/coupon lookups, order history). The backend is the only thing that talks to Swiggy MCP and holds the OAuth token; the frontend never calls Swiggy directly.
+React + Vite frontend, Node/Express backend, SQLite for local state (OAuth client + token, saved address id, cached menu/coupon lookups — `coupon_cache` is currently dead code, kept for future use, since coupon pricing no longer goes through a cacheable read-only call — order history). The backend is the only thing that talks to Swiggy MCP and holds the OAuth token; the frontend never calls Swiggy directly.
 
 ## Non-goals for this build
 
@@ -88,4 +106,4 @@ No Telegram bot. No multi-user support. No production Swiggy access application 
 
 ## Before shipping any Swiggy-calling code
 
-Re-fetch the specific tool's `.md` doc and confirm the parameter names and types match what's written above — this file is a snapshot taken while planning; the live docs are the source of truth.
+Re-fetch the specific tool's `.md` doc and confirm the parameter names and types match what's written above — this file is a living summary, not a snapshot; the live docs plus `ARCHITECTURE.md`'s verified-behavior notes are the source of truth. If you discover another gap between documented and actual behavior, record it in both files, not just fix around it silently.
