@@ -108,7 +108,5 @@ export const instamartClient = {
       ...(cartId ? { cartId } : {}),
     }),
 
-  getDeliveryStatus: ({ orderId, addressId }) => call("get_delivery_status", { orderId, addressId }),
-
   reportError: (payload) => call("report_error", payload),
 };

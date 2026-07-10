@@ -191,32 +191,173 @@ function distinctBrands(raw) {
 // filter to it — Swiggy's search stays fuzzy even for a brand-qualified
 // query ("amul milk" still returns Chitale, Gokul, etc as loose matches), so
 // re-checking brand count on those results would wrongly ask again.
-function flattenVariants(raw) {
+// `goToIndex`, when passed, tags each variant with the user's own go-to-items
+// rank (see §"most ordered" below) so sortVariants can promote it.
+function flattenVariants(raw, goToIndex) {
   const products = Array.isArray(raw?.products) ? raw.products : [];
   const out = [];
   for (const p of products) {
     const brand = p.brand || p.variations?.[0]?.brandName || null;
     for (const v of p.variations || []) {
       if (!v.spinId) continue;
+      const displayName = v.displayName || p.displayName || null;
+      const rank = goToIndex ? goToRankFor(v, brand, displayName, goToIndex) : undefined;
       out.push({
         spinId: String(v.spinId),
         skuId: v.skuId ? String(v.skuId) : null,
         brand: v.brandName || brand,
+        displayName,
         inStock: v.isInStockAndAvailable !== false,
         price: v.price?.offerPrice ?? v.price?.mrp ?? null,
+        mostOrdered: rank !== undefined,
+        orderRank: rank,
       });
     }
   }
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// "Most ordered by you" — cross-references live search/brand results against
+// Swiggy's own your_go_to_items (already used for "Reorder my usuals"), so a
+// broad request like "add a protein bar" can surface which specific product
+// the user actually buys, instead of an undifferentiated list. Deliberately
+// built on Swiggy's live data rather than a local order log: this app has no
+// durable per-item order history of its own, and your_go_to_items already IS
+// Swiggy's real "what does this user usually order" signal (verified live:
+// same products[]/variations[] shape as search_products, §2.5). Position in
+// that list is trusted as Swiggy's own frequency/recency
+// ranking, the same trust-Swiggy's-ordering principle already applied to
+// variant sort order — no local scoring reinvented.
+// ---------------------------------------------------------------------------
+const GO_TO_CACHE_TTL_MS = 5 * 60 * 1000;
+let goToCache = null; // { addressId, fetchedAt, bySpinId: Map, byKey: Map } | null
+
+function normalizeKey(brand, name) {
+  return `${(brand || "").toLowerCase().trim()}::${(name || "").toLowerCase().trim()}`;
+}
+
+// Primary match is the exact spinId (same pack/size the user actually
+// bought). Fallback is brand+name so a *different* pack size of a product
+// they buy regularly (e.g. go-to is the 1L pack, search surfaces the 500ml)
+// still counts — still an exact deterministic key match, not fuzzy text
+// similarity.
+function goToRankFor(variant, brand, displayName, goToIndex) {
+  const bySpin = goToIndex.bySpinId.get(String(variant.spinId));
+  if (bySpin !== undefined) return bySpin;
+  return goToIndex.byKey.get(normalizeKey(brand, displayName));
+}
+
+async function getGoToIndex(addressId) {
+  if (goToCache && goToCache.addressId === addressId && Date.now() - goToCache.fetchedAt < GO_TO_CACHE_TTL_MS) {
+    return goToCache;
+  }
+  const bySpinId = new Map();
+  const byKey = new Map();
+  try {
+    const raw = await instamartClient.yourGoToItems({ addressId });
+    const products = Array.isArray(raw?.products) ? raw.products : [];
+    let rank = 0;
+    for (const p of products) {
+      const brand = p.brand || p.variations?.[0]?.brandName || null;
+      for (const v of p.variations || []) {
+        if (!v.spinId) continue;
+        bySpinId.set(String(v.spinId), rank);
+        const key = normalizeKey(brand, v.displayName || p.displayName);
+        if (!byKey.has(key)) byKey.set(key, rank);
+        rank++;
+      }
+    }
+  } catch {
+    // Best-effort signal only — your_go_to_items failing (e.g. brand-new
+    // account with no history yet) must never block a normal search.
+  }
+  goToCache = { addressId, fetchedAt: Date.now(), bySpinId, byKey };
+  return goToCache;
+}
+
+// Called after a successful checkout so the very next search reflects the
+// order just placed, instead of waiting out the TTL.
+function invalidateGoToCache() {
+  goToCache = null;
+}
+
+// Aggregates per-variant go-to rank up to brand level (best/lowest rank among
+// any of that brand's variants in these results) so the brand-choice screen
+// can surface the same signal as the product-card badge.
+function brandGoToRanks(raw, goToIndex) {
+  const products = Array.isArray(raw?.products) ? raw.products : [];
+  const ranks = new Map();
+  for (const p of products) {
+    const brand = p.brand || p.variations?.[0]?.brandName;
+    if (!brand) continue;
+    for (const v of p.variations || []) {
+      if (!v.spinId) continue;
+      const r = goToRankFor(v, brand, v.displayName || p.displayName, goToIndex);
+      if (r === undefined) continue;
+      if (!ranks.has(brand) || r < ranks.get(brand)) ranks.set(brand, r);
+    }
+  }
+  return ranks;
+}
+
+// ---------------------------------------------------------------------------
+// Search relevance filter — Swiggy's search_products, like search_menu on the
+// Food server (ARCHITECTURE.md §2.4), falls back to loosely/semantically
+// related items rather than an empty list. Confirmed live: "chicken" surfaced
+// "Too Yumm Protein Chips" (no literal relation at all) alongside genuine
+// chicken products. Fixed with a deterministic keyword filter, not a second
+// LLM judgment call (§6.3's 129s incident is exactly the cost that decision
+// avoids) — a product survives only if one of the query's own significant
+// words appears in its name or brand. This can't distinguish "chicken breast"
+// from "chicken masala" (both literally contain "chicken") — accepted
+// trade-off for zero added latency/cost; a semantic pass would need an LLM
+// call per search.
+// ---------------------------------------------------------------------------
+const QUERY_STOPWORDS = new Set([
+  "a", "an", "the", "of", "for", "with", "and", "or", "to", "in", "on",
+  "my", "some", "please", "add", "buy", "order", "get", "me", "pack", "packet",
+]);
+
+function significantTokens(query) {
+  return String(query || "")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((t) => t.length > 1 && !QUERY_STOPWORDS.has(t));
+}
+
+// Cheap plural/singular tolerance ("cookies" query still matches a "Cookie"
+// product name) without pulling in a stemming library.
+function tokenVariants(token) {
+  return token.length > 3 && token.endsWith("s") ? [token, token.slice(0, -1)] : [token];
+}
+
+function filterRelevantProducts(raw, query) {
+  const products = Array.isArray(raw?.products) ? raw.products : [];
+  const tokens = significantTokens(query);
+  if (tokens.length === 0) return raw;
+  const relevant = products.filter((p) => {
+    const haystack = `${p.displayName || ""} ${p.brand || ""}`.toLowerCase();
+    return tokens.some((t) => tokenVariants(t).some((v) => haystack.includes(v)));
+  });
+  // If the filter would wipe out every result (Swiggy's match was purely
+  // semantic, no literal word overlap at all), keep the unfiltered set rather
+  // than reporting a false "nothing found" — same fallback principle already
+  // used for forceBrand below when a brand name doesn't match anything exactly.
+  return relevant.length > 0 ? { ...raw, products: relevant } : raw;
+}
+
 // Resolve variant refs back to full cards (with photo + price) from the
-// cache. Unknown ids are dropped so a bad ref never renders.
+// cache. Unknown ids are dropped so a bad ref never renders. A ref flagged
+// mostOrdered (see goToRankFor) gets the existing `note` field set — the UI
+// already renders product.note as a small badge line (originally added for
+// this kind of annotation), so no frontend change is needed.
 function enrichProducts(refs) {
   const out = [];
   for (const r of refs || []) {
     const card = productBySpin.get(String(r.spinId)) || productBySku.get(String(r.skuId));
-    if (card) out.push(card);
+    if (!card) continue;
+    out.push(r.mostOrdered ? { ...card, note: "(Most ordered by you)" } : card);
   }
   return out;
 }
@@ -242,12 +383,20 @@ function isAnyBrandChoice(userText) {
   return t === "any brand" || t === "any" || t === "all" || t === "all brands";
 }
 
-// In-stock first (established earlier: an out-of-stock item in the mix makes
-// Swiggy reject the whole update_cart, so buyable items must lead), then
-// price ascending within each group — the ordering requested for every
-// results screen, not just when "Any brand" is picked.
+// Most-ordered-by-you first (see goToRankFor — lower rank = higher
+// preference in Swiggy's own your_go_to_items ordering), then in-stock first
+// (established earlier: an out-of-stock item in the mix makes Swiggy reject
+// the whole update_cart, so buyable items must lead), then price ascending
+// within each group — the ordering requested for every results screen, not
+// just when "Any brand" is picked.
 function sortVariants(variants) {
   return [...variants].sort((a, b) => {
+    const moDiff = (b.mostOrdered ? 1 : 0) - (a.mostOrdered ? 1 : 0);
+    if (moDiff !== 0) return moDiff;
+    if (a.mostOrdered && b.mostOrdered) {
+      const rankDiff = (a.orderRank ?? 0) - (b.orderRank ?? 0);
+      if (rankDiff !== 0) return rankDiff;
+    }
     const stockDiff = (b.inStock ? 1 : 0) - (a.inStock ? 1 : 0);
     if (stockDiff !== 0) return stockDiff;
     const pa = a.price ?? Infinity;
@@ -263,9 +412,13 @@ function sortVariants(variants) {
 // `skipBrandAsk` means the user explicitly doesn't care which brand (picked
 // "Any brand") — show everything found, mixed brands, sorted by price.
 async function runSearchAndBranch(query, addressId, { forceBrand, skipBrandAsk } = {}) {
-  const raw = await instamartClient.searchProducts({ query, addressId });
+  const [rawSearch, goToIndex] = await Promise.all([
+    instamartClient.searchProducts({ query, addressId }),
+    getGoToIndex(addressId),
+  ]);
+  const raw = filterRelevantProducts(rawSearch, query);
   cacheProducts(raw);
-  let variants = flattenVariants(raw);
+  let variants = flattenVariants(raw, goToIndex);
 
   if (forceBrand) {
     const target = forceBrand.toLowerCase();
@@ -285,10 +438,18 @@ async function runSearchAndBranch(query, addressId, { forceBrand, skipBrandAsk }
   if (!forceBrand && !skipBrandAsk) {
     const brands = distinctBrands(raw);
     if (brands.length >= 2) {
-      pendingBrandChoice = { originalQuery: query, brandsOffered: brands };
+      // brandsOffered stays the CLEAN brand-name list — matchOfferedBrand and
+      // forceBrand filtering above key off these exact strings. Only the
+      // *displayed* option labels get the "(most ordered by you)" suffix; a
+      // click still sends that full label back, and matchOfferedBrand's
+      // substring check (below) still resolves it to the clean name.
+      const ranks = brandGoToRanks(raw, goToIndex);
+      const ranked = [...brands].sort((a, b) => (ranks.get(a) ?? Infinity) - (ranks.get(b) ?? Infinity));
+      pendingBrandChoice = { originalQuery: query, brandsOffered: ranked };
+      const options = ranked.map((b) => (ranks.has(b) ? `${b} (most ordered by you)` : b));
       return {
         kind: "choice",
-        payload: { question: `Which brand of ${query} would you like?`, options: [...brands, ANY_BRAND_LABEL] },
+        payload: { question: `Which brand of ${query} would you like?`, options: [...options, ANY_BRAND_LABEL] },
       };
     }
   }
@@ -448,8 +609,13 @@ function makeExecuteTool(addressId) {
         return instamartClient.clearCart();
       case "get_payment_options":
         return instamartClient.getPaymentOptions({ addressId });
-      case "checkout":
-        return instamartClient.checkout({ ...args, addressId });
+      case "checkout": {
+        const result = await instamartClient.checkout({ ...args, addressId });
+        // The order just placed should count toward "most ordered" on the
+        // very next search, not after a stale cache TTL expires.
+        invalidateGoToCache();
+        return result;
+      }
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
