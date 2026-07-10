@@ -175,7 +175,7 @@ export function InstamartChat() {
         </div>
 
         <div className="cart-column">
-          <CartSummary cart={cart} />
+          <CartSummary cart={cart} onCartUpdate={setCart} />
         </div>
       </div>
     </section>
@@ -189,7 +189,13 @@ function ChatMessage({ message, disabled, onChoose, onAdd, onShowMore }) {
         <div className="chat-message chat-message-assistant">{message.question}</div>
         <div className="choice-chips">
           {message.options.map((opt) => (
-            <button key={opt} type="button" className="choice-chip" onClick={() => onChoose(opt)} disabled={disabled}>
+            <button
+              key={opt}
+              type="button"
+              className={`choice-chip${opt === "Any brand" ? " choice-chip--any" : ""}`}
+              onClick={() => onChoose(opt)}
+              disabled={disabled}
+            >
               {opt}
             </button>
           ))}

@@ -928,6 +928,19 @@ button:disabled {
   color: var(--text-dark);
 }
 
+/* "Any brand" — visually distinct from a real brand name (dashed, muted) */
+.choice-chip--any {
+  border-style: dashed;
+  border-color: var(--border-strong);
+  color: var(--text-muted);
+}
+
+.choice-chip--any:hover:not(:disabled) {
+  background: var(--bg-subtle);
+  color: var(--text-dark);
+  border-color: var(--border-strong);
+}
+
 /* product option cards */
 .product-grid {
   display: grid;
@@ -1223,6 +1236,48 @@ button:disabled {
 .cart-item-price {
   font-weight: 700;
   color: var(--text-dark);
+}
+
+.qty-stepper {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.qty-stepper-btn {
+  background: var(--bg-subtle);
+  color: var(--orange-dark);
+  border: none;
+  border-radius: 0;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  font-size: 0.95rem;
+  font-weight: 700;
+  line-height: 1;
+  display: grid;
+  place-items: center;
+}
+
+.qty-stepper-btn:hover:not(:disabled) {
+  background: var(--orange-tint);
+}
+
+.qty-stepper-value {
+  min-width: 20px;
+  text-align: center;
+  font-weight: 700;
+  color: var(--text-dark);
+  font-size: 0.82rem;
+}
+
+.cart-item-error {
+  font-size: 0.72rem;
+  color: var(--red);
+  font-weight: 500;
 }
 
 .cart-total {

@@ -203,6 +203,7 @@ function flattenVariants(raw) {
         skuId: v.skuId ? String(v.skuId) : null,
         brand: v.brandName || brand,
         inStock: v.isInStockAndAvailable !== false,
+        price: v.price?.offerPrice ?? v.price?.mrp ?? null,
       });
     }
   }
@@ -230,11 +231,38 @@ function enrichProducts(refs) {
 let pendingBrandChoice = null; // { originalQuery, brandsOffered: string[] } | null
 let lastSearchContext = null; // { query, allVariants, shown } | null — for "show more"
 
+// Shown as one more chip alongside real brand names when a search spans 2+
+// brands, for items where the brand genuinely doesn't matter to the user.
+// Checked by exact/near-exact text match (see isAnyBrandChoice), never by
+// substring against real brand names, so it can't collide with one.
+const ANY_BRAND_LABEL = "Any brand";
+
+function isAnyBrandChoice(userText) {
+  const t = userText.trim().toLowerCase();
+  return t === "any brand" || t === "any" || t === "all" || t === "all brands";
+}
+
+// In-stock first (established earlier: an out-of-stock item in the mix makes
+// Swiggy reject the whole update_cart, so buyable items must lead), then
+// price ascending within each group — the ordering requested for every
+// results screen, not just when "Any brand" is picked.
+function sortVariants(variants) {
+  return [...variants].sort((a, b) => {
+    const stockDiff = (b.inStock ? 1 : 0) - (a.inStock ? 1 : 0);
+    if (stockDiff !== 0) return stockDiff;
+    const pa = a.price ?? Infinity;
+    const pb = b.price ?? Infinity;
+    return pa - pb;
+  });
+}
+
 // `forceBrand`, when set, means the user already answered "which brand" —
 // there is nothing left to ask, no matter how many other brands Swiggy's
 // fuzzy search mixes into these particular results. Filter down to the
 // confirmed brand and go straight to variants.
-async function runSearchAndBranch(query, addressId, { forceBrand } = {}) {
+// `skipBrandAsk` means the user explicitly doesn't care which brand (picked
+// "Any brand") — show everything found, mixed brands, sorted by price.
+async function runSearchAndBranch(query, addressId, { forceBrand, skipBrandAsk } = {}) {
   const raw = await instamartClient.searchProducts({ query, addressId });
   cacheProducts(raw);
   let variants = flattenVariants(raw);
@@ -247,21 +275,21 @@ async function runSearchAndBranch(query, addressId, { forceBrand } = {}) {
     if (filtered.length > 0) variants = filtered;
   }
 
-  // Lead with buyable items — out-of-stock variants sink to the end (shown
-  // marked/disabled only if they'd otherwise fill empty slots). Array.sort is
-  // stable, so Swiggy's own ordering is preserved within each group.
-  variants = [...variants].sort((a, b) => (b.inStock ? 1 : 0) - (a.inStock ? 1 : 0));
+  variants = sortVariants(variants);
 
   if (variants.length === 0) {
     pendingBrandChoice = null;
     return { kind: "empty", payload: { query } };
   }
 
-  if (!forceBrand) {
+  if (!forceBrand && !skipBrandAsk) {
     const brands = distinctBrands(raw);
     if (brands.length >= 2) {
       pendingBrandChoice = { originalQuery: query, brandsOffered: brands };
-      return { kind: "choice", payload: { question: `Which brand of ${query} would you like?`, options: brands } };
+      return {
+        kind: "choice",
+        payload: { question: `Which brand of ${query} would you like?`, options: [...brands, ANY_BRAND_LABEL] },
+      };
     }
   }
 
@@ -407,8 +435,15 @@ function makeExecuteTool(addressId) {
       }
       case "get_cart":
         return compactCartForModel(await instamartClient.getCart());
-      case "update_cart":
+      case "update_cart": {
+        // update_cart rejects an empty items array (confirmed live) — if the
+        // model is trying to empty the cart (e.g. "remove my only item"),
+        // that has to go through clear_cart instead.
+        if (!Array.isArray(args.items) || args.items.length === 0) {
+          return compactCartForModel(await instamartClient.clearCart().then(() => instamartClient.getCartOrEmpty()));
+        }
         return compactCartForModel(await instamartClient.updateCart({ selectedAddressId: addressId, items: args.items }));
+      }
       case "clear_cart":
         return instamartClient.clearCart();
       case "get_payment_options":
@@ -483,6 +518,15 @@ export async function sendMessage(userText, addressId, displayText = userText) {
   // them there is exactly one correct action — search narrowed to it. No
   // ambiguity to resolve, so no reason to spend a Groq call resolving it.
   if (pendingBrandChoice) {
+    if (isAnyBrandChoice(userText)) {
+      const { kind, payload } = await runSearchAndBranch(pendingBrandChoice.originalQuery, addressId, {
+        skipBrandAsk: true,
+      });
+      const { entry, responsePayload } = buildFromBranch(kind, payload, "");
+      displayTranscript.push(entry);
+      trimConversation();
+      return { ...responsePayload, cart: null };
+    }
     const matched = matchOfferedBrand(userText, pendingBrandChoice.brandsOffered);
     if (matched) {
       const { kind, payload } = await runSearchAndBranch(`${matched} ${pendingBrandChoice.originalQuery}`, addressId, {
@@ -634,6 +678,34 @@ export async function reorderUsualsDirect({ addressId, displayText = "Reorder my
   displayTranscript.push({ role: "assistant", text: reply });
   trimConversation();
   return { reply, cart };
+}
+
+// Cart quantity stepper (+/- on a cart line item). Unlike the other direct
+// actions above, this deliberately does NOT push a displayTranscript entry —
+// it's a plain cart-state mutation, not a chat event, matching how every
+// real e-commerce cart stepper behaves (clicking + a few times shouldn't
+// spam the conversation log). quantity <= 0 removes the item entirely.
+export async function setItemQuantity({ addressId, spinId, skuId, quantity }) {
+  try {
+    const current = await instamartClient.getCartOrEmpty();
+    const items = (current.items || [])
+      .filter((i) => !(String(i.spinId) === String(spinId) && String(i.skuId) === String(skuId)))
+      .map((i) => ({ spinId: i.spinId, skuId: i.skuId, quantity: i.quantity }));
+    if (quantity > 0) items.push({ spinId, skuId, quantity });
+    if (items.length === 0) {
+      // update_cart rejects an empty items array ("items array is required
+      // and must contain at least one item", confirmed live) — removing the
+      // very last item in the cart has to go through clear_cart instead.
+      await instamartClient.clearCart();
+    } else {
+      await instamartClient.updateCart({ selectedAddressId: addressId, items });
+    }
+    const cart = await instamartClient.getCartOrEmpty();
+    return { cart };
+  } catch (err) {
+    const cart = await instamartClient.getCartOrEmpty().catch(() => null);
+    return { cart, error: friendlyCartError(err) };
+  }
 }
 
 export function resetConversation() {

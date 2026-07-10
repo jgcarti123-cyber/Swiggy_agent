@@ -56,6 +56,8 @@ export const api = {
   instamartShowMore: () => request("/api/instamart/show-more", { method: "POST" }),
   instamartClearCart: () => request("/api/instamart/clear-cart", { method: "POST" }),
   instamartReorderUsuals: () => request("/api/instamart/reorder-usuals", { method: "POST" }),
+  instamartSetQuantity: (spinId, skuId, quantity) =>
+    request("/api/instamart/set-quantity", { method: "POST", body: JSON.stringify({ spinId, skuId, quantity }) }),
 };
 
 export { ApiError };

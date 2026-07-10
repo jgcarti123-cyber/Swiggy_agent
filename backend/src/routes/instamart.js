@@ -9,6 +9,7 @@ import {
   showMoreDirect,
   clearCartDirect,
   reorderUsualsDirect,
+  setItemQuantity,
 } from "../agent/instamartAgent.js";
 
 export const instamartRouter = Router();
@@ -100,5 +101,18 @@ instamartRouter.post("/reorder-usuals", async (req, res) => {
   const addressId = requireSavedAddress(res);
   if (!addressId) return;
   const result = await reorderUsualsDirect({ addressId });
+  res.json(result);
+});
+
+// Quantity stepper on a cart line item. quantity <= 0 removes it.
+instamartRouter.post("/set-quantity", async (req, res) => {
+  const { spinId, skuId, quantity } = req.body || {};
+  if (!spinId || !skuId || quantity === undefined) {
+    res.status(400).json({ error: "VALIDATION_ERROR", message: "spinId, skuId, and quantity are required" });
+    return;
+  }
+  const addressId = requireSavedAddress(res);
+  if (!addressId) return;
+  const result = await setItemQuantity({ addressId, spinId, skuId, quantity: Number(quantity) });
   res.json(result);
 });

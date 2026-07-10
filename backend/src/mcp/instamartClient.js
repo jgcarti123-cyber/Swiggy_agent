@@ -11,6 +11,28 @@ const call = (name, args) => callSwiggyTool(SERVER_URL, name, args);
 // still propagate.
 const EMPTY_CART_MESSAGE = /cart not found|session expired|cart is empty|no items|no active cart|empty cart/i;
 
+// update_cart is idempotent — it always REPLACES the cart with the given item
+// list, so calling it again with the identical payload lands on the same end
+// state, never a duplicate side effect. It's also empirically flaky: the
+// exact same call, unmodified, has been observed to fail once ("Swiggy isn't
+// letting this one be added") then succeed moments later with no code change
+// on either side. One short retry turns that into a silent recovery instead
+// of a user-facing error. Deliberately NOT applied to checkout/confirm_order
+// — those are real payment/order actions, not idempotent, and retrying one
+// blindly could create a duplicate order; a transient failure there must
+// surface to the user rather than be retried automatically.
+async function callWithRetry(name, args, { retries = 1, delayMs = 700 } = {}) {
+  try {
+    return await call(name, args);
+  } catch (err) {
+    if (retries > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      return callWithRetry(name, args, { retries: retries - 1, delayMs });
+    }
+    throw err;
+  }
+}
+
 export const instamartClient = {
   getAddresses: ({ page = 1, pageSize = 10 } = {}) => call("get_addresses", { page, pageSize }),
 
@@ -19,7 +41,7 @@ export const instamartClient = {
 
   // Replaces the ENTIRE cart — never additive. Callers must get_cart first,
   // merge, then send the full item list back.
-  updateCart: ({ selectedAddressId, items }) => call("update_cart", { selectedAddressId, items }),
+  updateCart: ({ selectedAddressId, items }) => callWithRetry("update_cart", { selectedAddressId, items }),
 
   getCart: () => call("get_cart", {}),
 
@@ -37,7 +59,9 @@ export const instamartClient = {
     }
   },
 
-  clearCart: () => call("clear_cart", {}),
+  // Also idempotent (clearing an already-empty cart is a no-op) — same retry
+  // reasoning as updateCart above.
+  clearCart: () => callWithRetry("clear_cart", {}),
 
   yourGoToItems: ({ addressId, offset = 0 }) => call("your_go_to_items", { addressId, offset }),
 

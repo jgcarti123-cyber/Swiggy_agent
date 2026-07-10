@@ -64,15 +64,26 @@ function extractResult(result, toolName) {
   return textBlocks.join("\n");
 }
 
+// Not a Swiggy tool-level rejection (wrong item, out of stock, etc) — a raw
+// transport/connection failure. Confirmed live: a long-running cached client
+// kept failing every call with "fetch failed" while a brand-new connection to
+// the identical server succeeded immediately, meaning the cached connection
+// itself had gone bad, not the request. Retrying through the SAME cache entry
+// just repeats the same failure.
+const NETWORK_ERROR_PATTERN = /fetch failed|ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|network error|ETIMEDOUT/i;
+
 export async function callSwiggyTool(serverUrl, name, args) {
   const client = await getClient(serverUrl);
   try {
     const result = await client.callTool({ name, arguments: args });
     return extractResult(result, name);
   } catch (err) {
-    // A 401 mid-session means the token was revoked/expired server-side;
-    // drop the cached connection so the next call re-checks getValidAccessToken().
-    if (err?.code === 401 || /401|unauthorized/i.test(String(err?.message))) {
+    // A 401 mid-session means the token was revoked/expired server-side; a
+    // network-level failure means the cached connection is broken. Either
+    // way, drop it so the next call (including instamartClient's retry)
+    // reconnects from scratch instead of repeatedly hitting the same dead
+    // connection.
+    if (err?.code === 401 || /401|unauthorized/i.test(String(err?.message)) || NETWORK_ERROR_PATTERN.test(String(err?.message))) {
       cache.delete(serverUrl);
     }
     throw err;

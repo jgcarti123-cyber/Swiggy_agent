@@ -1,3 +1,5 @@
+import { useState } from "react";
+import { api } from "../api.js";
 import { ProductThumb } from "./ProductThumb.jsx";
 
 function first(obj, keys) {
@@ -8,9 +10,10 @@ function first(obj, keys) {
 }
 
 // Field names confirmed against a live get_cart response (items[] with
-// itemName / quantity / mrp / discountedFinalPrice / imageUrl, plus
-// cartTotalAmount and billBreakdown.toPay). Fallback key-name variants are
-// kept so an unexpected shape still renders rather than hiding real data.
+// itemName / quantity / mrp / discountedFinalPrice / imageUrl / spinId /
+// skuId, plus cartTotalAmount and billBreakdown.toPay). Fallback key-name
+// variants are kept so an unexpected shape still renders rather than hiding
+// real data.
 function normalizeCart(cart) {
   const items = first(cart, ["items", "cartItems", "products"]);
   if (!Array.isArray(items)) return null;
@@ -21,6 +24,8 @@ function normalizeCart(cart) {
       price: first(item, ["discountedFinalPrice", "offerPrice", "price", "totalPrice"]),
       mrp: first(item, ["mrp"]),
       imageUrl: first(item, ["imageUrl", "image", "img"]) || null,
+      spinId: first(item, ["spinId"]) || null,
+      skuId: first(item, ["skuId"]) || null,
     })),
     total:
       first(cart, ["cartTotalAmount", "total", "grandTotal", "payableAmount"]) ??
@@ -47,7 +52,29 @@ function money(value) {
   return typeof value === "string" ? value : `₹${value}`;
 }
 
-export function CartSummary({ cart }) {
+// onCartUpdate lets the stepper push a fresh cart up to the parent after a
+// mutation, without going through the chat pipeline — a +/- click is a plain
+// cart edit, not a chat event (see setItemQuantity on the backend).
+export function CartSummary({ cart, onCartUpdate }) {
+  const [pendingKey, setPendingKey] = useState(null);
+  const [itemError, setItemError] = useState(null); // { key, message } | null
+
+  async function changeQuantity(item, delta) {
+    if (!item.spinId || !item.skuId) return;
+    const key = `${item.spinId}:${item.skuId}`;
+    setPendingKey(key);
+    setItemError(null);
+    try {
+      const result = await api.instamartSetQuantity(item.spinId, item.skuId, item.quantity + delta);
+      if (result.error) setItemError({ key, message: result.error });
+      if (result.cart) onCartUpdate?.(result.cart);
+    } catch (err) {
+      setItemError({ key, message: err.message || "Couldn't update quantity" });
+    } finally {
+      setPendingKey(null);
+    }
+  }
+
   if (!cart) return <EmptyCart label="No cart activity yet" />;
 
   if (cart.error) {
@@ -69,18 +96,47 @@ export function CartSummary({ cart }) {
       {normalized ? (
         <>
           <ul className="cart-items">
-            {normalized.items.map((item, i) => (
-              <li key={i} className="cart-item">
-                <ProductThumb src={item.imageUrl} alt={item.name} className="cart-item-thumb" />
-                <div className="cart-item-info">
-                  <span className="cart-item-name">{item.name}</span>
-                  <span className="cart-item-meta">
-                    <span className="cart-item-qty">{item.quantity}×</span>
-                    {item.price !== undefined && <span className="cart-item-price">{money(item.price)}</span>}
-                  </span>
-                </div>
-              </li>
-            ))}
+            {normalized.items.map((item, i) => {
+              const key = item.spinId && item.skuId ? `${item.spinId}:${item.skuId}` : `idx-${i}`;
+              const isPending = pendingKey === key;
+              return (
+                <li key={i} className="cart-item">
+                  <ProductThumb src={item.imageUrl} alt={item.name} className="cart-item-thumb" />
+                  <div className="cart-item-info">
+                    <span className="cart-item-name">{item.name}</span>
+                    <span className="cart-item-meta">
+                      {item.spinId && item.skuId ? (
+                        <span className="qty-stepper">
+                          <button
+                            type="button"
+                            className="qty-stepper-btn"
+                            onClick={() => changeQuantity(item, -1)}
+                            disabled={isPending}
+                            aria-label={`Decrease ${item.name} quantity`}
+                          >
+                            −
+                          </button>
+                          <span className="qty-stepper-value">{item.quantity}</span>
+                          <button
+                            type="button"
+                            className="qty-stepper-btn"
+                            onClick={() => changeQuantity(item, 1)}
+                            disabled={isPending}
+                            aria-label={`Increase ${item.name} quantity`}
+                          >
+                            +
+                          </button>
+                        </span>
+                      ) : (
+                        <span className="cart-item-qty">{item.quantity}×</span>
+                      )}
+                      {item.price !== undefined && <span className="cart-item-price">{money(item.price)}</span>}
+                    </span>
+                    {itemError?.key === key && <span className="cart-item-error">{itemError.message}</span>}
+                  </div>
+                </li>
+              );
+            })}
           </ul>
           {normalized.total !== undefined && normalized.total !== null && (
             <p className="cart-total">
