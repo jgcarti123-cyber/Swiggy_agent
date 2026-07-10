@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { instamartClient } from "../mcp/instamartClient.js";
+import { getSavedAddress } from "../db.js";
 import { sendMessage, resetConversation, getConversationForDisplay } from "../agent/instamartAgent.js";
 
 export const instamartRouter = Router();
@@ -11,7 +12,9 @@ instamartRouter.get("/addresses", async (req, res) => {
 });
 
 instamartRouter.get("/cart", async (req, res) => {
-  res.json(await instamartClient.getCart());
+  // getCartOrEmpty so a "no cart yet" state renders as an empty cart in the UI
+  // instead of a 502 tool error.
+  res.json(await instamartClient.getCartOrEmpty());
 });
 
 instamartRouter.get("/chat/history", (req, res) => {
@@ -29,6 +32,14 @@ instamartRouter.post("/chat", async (req, res) => {
     res.status(400).json({ error: "VALIDATION_ERROR", message: "message is required" });
     return;
   }
-  const result = await sendMessage(message);
+  // The delivery address is resolved here (from the address the user picked in
+  // the UI) and passed to the agent, which injects it into every tool call —
+  // the model never asks for or handles an address.
+  const saved = getSavedAddress();
+  if (!saved) {
+    res.status(400).json({ error: "NO_ADDRESS", message: "Select a delivery address first." });
+    return;
+  }
+  const result = await sendMessage(message, saved.address_id);
   res.json(result);
 });

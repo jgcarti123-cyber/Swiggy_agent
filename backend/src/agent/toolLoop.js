@@ -7,7 +7,14 @@ import { config } from "../config.js";
 // This loop is shared by the food-discovery agent (one-shot, ends when a
 // designated `finalToolName` is called) and the Instamart chat agent
 // (multi-turn, ends when the model replies with no tool_calls).
-export async function runToolLoop({ messages, tools, executeTool, finalToolName, maxIterations = 12 }) {
+export async function runToolLoop({
+  messages,
+  tools,
+  executeTool,
+  finalToolName,
+  maxIterations = 12,
+  maxTokens = 4096,
+}) {
   const executedTools = [];
 
   for (let i = 0; i < maxIterations; i++) {
@@ -18,7 +25,7 @@ export async function runToolLoop({ messages, tools, executeTool, finalToolName,
       messages,
       tools,
       tool_choice: "auto",
-      max_tokens: 4096,
+      max_tokens: maxTokens,
     });
     const completionMs = Date.now() - t0;
 

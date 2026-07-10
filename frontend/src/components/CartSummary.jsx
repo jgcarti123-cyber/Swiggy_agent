@@ -26,38 +26,48 @@ function normalizeCart(cart) {
   };
 }
 
-export function CartSummary({ cart }) {
-  if (!cart) {
-    return (
-      <div className="cart-summary">
-        <h3>Cart</h3>
-        <p className="muted">No cart activity yet.</p>
+function EmptyCart({ label = "Your cart is empty" }) {
+  return (
+    <div className="cart-summary">
+      <h3>Cart</h3>
+      <div className="cart-empty-state">
+        <span className="cart-empty-icon" aria-hidden="true">🛒</span>
+        <p className="muted">{label}</p>
+        <p className="cart-empty-hint">Ask Pantry Pal to add something.</p>
       </div>
-    );
-  }
+    </div>
+  );
+}
 
+export function CartSummary({ cart }) {
+  if (!cart) return <EmptyCart label="No cart activity yet" />;
+
+  // A genuine failure (not the normal "no cart yet" case, which the backend
+  // already turns into an empty cart) — keep it low-key rather than dumping a
+  // raw support message.
   if (cart.error) {
     return (
       <div className="cart-summary">
         <h3>Cart</h3>
-        <p className="error-text">{cart.error}</p>
+        <p className="muted">Couldn't load your cart right now. Try again in a moment.</p>
       </div>
     );
   }
 
   const normalized = normalizeCart(cart);
 
+  if (normalized && normalized.items.length === 0) return <EmptyCart />;
+
   return (
     <div className="cart-summary">
       <h3>Cart (live)</h3>
       {normalized ? (
         <>
-          {normalized.items.length === 0 && <p className="muted">Cart is empty.</p>}
           <ul>
             {normalized.items.map((item, i) => (
               <li key={i}>
-                {item.quantity}× {item.name}
-                {item.price !== undefined ? ` — ₹${item.price}` : ""}
+                <span className="cart-item-qty">{item.quantity}×</span> {item.name}
+                {item.price !== undefined ? <span className="cart-item-price">₹{item.price}</span> : null}
               </li>
             ))}
           </ul>

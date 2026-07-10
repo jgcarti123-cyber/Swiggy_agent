@@ -1,9 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api.js";
+import { AddressPicker } from "./AddressPicker.jsx";
 import { CartSummary } from "./CartSummary.jsx";
 import { ReauthNotice, isReauthError } from "./ReauthNotice.jsx";
 
+const QUICK_ACTIONS = [
+  { label: "Reorder my usuals", message: "Reorder my usual items" },
+  { label: "Clear cart", message: "Clear my cart" },
+];
+
 export function InstamartChat() {
+  const [hasAddress, setHasAddress] = useState(false);
   const [messages, setMessages] = useState([]);
   const [cart, setCart] = useState(null);
   const [input, setInput] = useState("");
@@ -25,18 +32,17 @@ export function InstamartChat() {
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  }, [messages, sending]);
 
-  async function send(e) {
-    e.preventDefault();
-    const text = input.trim();
-    if (!text || sending) return;
+  async function sendText(text) {
+    const trimmed = text.trim();
+    if (!trimmed || sending || !hasAddress) return;
     setInput("");
     setError(null);
-    setMessages((prev) => [...prev, { role: "user", text }]);
+    setMessages((prev) => [...prev, { role: "user", text: trimmed }]);
     setSending(true);
     try {
-      const result = await api.instamartChatSend(text);
+      const result = await api.instamartChatSend(trimmed);
       setMessages((prev) => [...prev, { role: "assistant", text: result.reply || "(no reply)" }]);
       if (result.cart) setCart(result.cart);
     } catch (err) {
@@ -48,6 +54,11 @@ export function InstamartChat() {
     } finally {
       setSending(false);
     }
+  }
+
+  function send(e) {
+    e.preventDefault();
+    sendText(input);
   }
 
   async function reset() {
@@ -65,30 +76,60 @@ export function InstamartChat() {
           Tell me what you need in plain words and I'll build your Instamart cart for you.
         </p>
       </header>
+
+      <AddressPicker onSelected={() => setHasAddress(true)} />
+
       <div className="instamart-layout">
         <div className="chat-column">
           <div className="chat-messages">
-            {messages.length === 0 && (
-              <p className="muted">
-                Try: "add 2 bananas and a liter of milk" or "what's in my cart?"
-              </p>
+            {messages.length === 0 && !sending && (
+              <div className="chat-empty">
+                <p className="chat-empty-title">👋 Hi, I'm Pantry Pal</p>
+                <p className="muted">
+                  Try <em>"add 2 bananas and a litre of milk"</em>, <em>"remove the bread"</em>, or{" "}
+                  <em>"checkout with cash"</em>.
+                </p>
+              </div>
             )}
             {messages.map((m, i) => (
               <div key={i} className={`chat-message chat-message-${m.role}`}>
                 {m.text}
               </div>
             ))}
+            {sending && (
+              <div className="chat-message chat-message-assistant chat-typing" aria-label="Pantry Pal is typing">
+                <span></span>
+                <span></span>
+                <span></span>
+              </div>
+            )}
             <div ref={bottomRef} />
           </div>
+
           {error && <p className="error-text">{error}</p>}
+
+          <div className="quick-actions">
+            {QUICK_ACTIONS.map((qa) => (
+              <button
+                key={qa.label}
+                type="button"
+                className="quick-action"
+                onClick={() => sendText(qa.message)}
+                disabled={sending || !hasAddress}
+              >
+                {qa.label}
+              </button>
+            ))}
+          </div>
+
           <form onSubmit={send} className="chat-input-row">
             <input
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              placeholder="What do you want to order?"
-              disabled={sending}
+              placeholder={hasAddress ? "What do you want to order?" : "Pick a delivery address first…"}
+              disabled={sending || !hasAddress}
             />
-            <button type="submit" disabled={sending}>
+            <button type="submit" disabled={sending || !hasAddress}>
               {sending ? "…" : "Send"}
             </button>
           </form>
@@ -96,6 +137,7 @@ export function InstamartChat() {
             Reset conversation
           </button>
         </div>
+
         <div className="cart-column">
           <CartSummary cart={cart} />
         </div>
