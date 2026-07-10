@@ -5,11 +5,6 @@ import { CartSummary } from "./CartSummary.jsx";
 import { ProductThumb } from "./ProductThumb.jsx";
 import { ReauthNotice, isReauthError } from "./ReauthNotice.jsx";
 
-const QUICK_ACTIONS = [
-  { label: "Reorder my usuals", message: "Reorder my usual items" },
-  { label: "Clear cart", message: "Clear my cart" },
-];
-
 // Turn a /chat response into a renderable transcript message.
 function assistantMessageFromResult(result) {
   if (result.choice) {
@@ -46,17 +41,18 @@ export function InstamartChat() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, sending]);
 
-  // displayText shows in the transcript; intentText (optional) is what the
-  // model actually receives (used by Add buttons to pass exact spinId/skuId).
-  async function sendMsg(displayText, intentText) {
-    const trimmed = (displayText || "").trim();
-    if (!trimmed || sending || !hasAddress) return;
-    setInput("");
+  // Shared by every user action (typed message, Add-button click, quick
+  // action, show-more): push the user bubble immediately, run whichever API
+  // call actually answers it, then render the response the same way
+  // regardless of whether that call went through the LLM chat loop or one of
+  // the deterministic direct-action endpoints.
+  async function runAction(displayText, apiCall) {
+    if (sending || !hasAddress) return;
     setError(null);
-    setMessages((prev) => [...prev, { role: "user", text: trimmed }]);
+    setMessages((prev) => [...prev, { role: "user", text: displayText }]);
     setSending(true);
     try {
-      const result = await api.instamartChatSend(trimmed, intentText);
+      const result = await apiCall();
       setMessages((prev) => [...prev, assistantMessageFromResult(result)]);
       if (result.cart) setCart(result.cart);
     } catch (err) {
@@ -67,19 +63,36 @@ export function InstamartChat() {
     }
   }
 
+  function sendMsg(text) {
+    const trimmed = (text || "").trim();
+    if (!trimmed) return;
+    runAction(trimmed, () => api.instamartChatSend(trimmed));
+  }
+
   function onSubmit(e) {
     e.preventDefault();
     sendMsg(input);
+    setInput("");
   }
 
   function addProduct(p) {
     const size = p.quantityDescription ? ` (${p.quantityDescription})` : "";
-    const display = `Add ${p.displayName}${size}`;
-    // Explicit merge instruction + exact ids so the model reliably calls
-    // get_cart then update_cart with the full list, rather than replying as if
-    // it added the item without actually touching the cart.
-    const intent = `Add this exact item to my cart, keeping everything already in the cart: ${p.displayName}${p.quantityDescription ? `, ${p.quantityDescription}` : ""}, spinId=${p.spinId}, skuId=${p.skuId}, quantity 1. Call get_cart then update_cart with the merged list.`;
-    sendMsg(display, intent);
+    const displayText = `Add ${p.displayName}${size}`;
+    // Deterministic — the exact spinId/skuId is already known, so this skips
+    // the LLM loop entirely (get_cart + merge + update_cart in code).
+    runAction(displayText, () => api.instamartAddItem(p.spinId, p.skuId, 1, displayText));
+  }
+
+  function showMore() {
+    runAction("Show more options", () => api.instamartShowMore());
+  }
+
+  function reorderUsuals() {
+    runAction("Reorder my usual items", () => api.instamartReorderUsuals());
+  }
+
+  function clearCart() {
+    runAction("Clear my cart", () => api.instamartClearCart());
   }
 
   async function reset() {
@@ -120,7 +133,7 @@ export function InstamartChat() {
                 disabled={sending || !hasAddress}
                 onChoose={(opt) => sendMsg(opt)}
                 onAdd={addProduct}
-                onShowMore={() => sendMsg("Show me more options")}
+                onShowMore={showMore}
               />
             ))}
 
@@ -137,17 +150,12 @@ export function InstamartChat() {
           {error && <p className="error-text">{error}</p>}
 
           <div className="quick-actions">
-            {QUICK_ACTIONS.map((qa) => (
-              <button
-                key={qa.label}
-                type="button"
-                className="quick-action"
-                onClick={() => sendMsg(qa.message)}
-                disabled={sending || !hasAddress}
-              >
-                {qa.label}
-              </button>
-            ))}
+            <button type="button" className="quick-action" onClick={reorderUsuals} disabled={sending || !hasAddress}>
+              Reorder my usuals
+            </button>
+            <button type="button" className="quick-action" onClick={clearCart} disabled={sending || !hasAddress}>
+              Clear cart
+            </button>
           </div>
 
           <form onSubmit={onSubmit} className="chat-input-row">
@@ -211,9 +219,13 @@ function ChatMessage({ message, disabled, onChoose, onAdd, onShowMore }) {
 
 function ProductCard({ product: p, disabled, onAdd }) {
   const hasDiscount = p.mrp != null && p.offerPrice != null && p.mrp > p.offerPrice;
+  const outOfStock = p.inStock === false;
   return (
-    <div className="product-card">
-      <ProductThumb src={p.imageUrl} alt={p.displayName} className="product-card-img" />
+    <div className={`product-card${outOfStock ? " product-card--oos" : ""}`}>
+      <div className="product-card-imgwrap">
+        <ProductThumb src={p.imageUrl} alt={p.displayName} className="product-card-img" />
+        {outOfStock && <span className="oos-badge">Out of stock</span>}
+      </div>
       <div className="product-card-body">
         <p className="product-card-name">{p.displayName}</p>
         {p.quantityDescription && <p className="product-card-qty">{p.quantityDescription}</p>}
@@ -223,8 +235,13 @@ function ProductCard({ product: p, disabled, onAdd }) {
             ₹{p.offerPrice ?? p.mrp}
             {hasDiscount && <span className="product-card-mrp">₹{p.mrp}</span>}
           </span>
-          <button type="button" className="product-add-btn" onClick={onAdd} disabled={disabled}>
-            Add
+          <button
+            type="button"
+            className="product-add-btn"
+            onClick={onAdd}
+            disabled={disabled || outOfStock}
+          >
+            {outOfStock ? "N/A" : "Add"}
           </button>
         </div>
       </div>

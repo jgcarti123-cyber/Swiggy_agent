@@ -4,11 +4,19 @@ import { config } from "../config.js";
 // Groq has no server-side tool execution like Anthropic's beta MCP
 // connector — every tool_call the model emits has to be executed here and
 // fed back as a `role: "tool"` message before asking the model to continue.
-// The loop ends either when the model replies with no tool_calls, or when it
-// calls one of `finalToolNames` — a "turn-ending" tool whose args are handed
-// back to the caller to act on (e.g. the Instamart agent's ask_choice /
-// present_products, which render UI rather than feed a result back to the
-// model).
+// The loop ends when any of:
+//  (a) the model replies with no tool_calls,
+//  (b) it calls one of `finalToolNames` — a tool the model itself decided
+//      ends the turn (args handed back, never executed),
+//  (c) `executeTool` resolves to a { __endLoop, kind, payload } sentinel — a
+//      tool that DID run for real, but whose result the caller has already
+//      turned into the final answer deterministically, so there's no need to
+//      feed it back and pay for another completion just to have the model
+//      restate what the caller already decided.
+// (c) exists because most of what used to be model judgment turned out to
+// have exactly one correct outcome (e.g. "how many brands were found" —
+// ask if 2+, otherwise show variants) — deciding that in code is free and
+// instant, where asking the model to decide costs a full round-trip.
 export async function runToolLoop({
   messages,
   tools,
@@ -22,6 +30,10 @@ export async function runToolLoop({
 
   for (let i = 0; i < maxIterations; i++) {
     const t0 = Date.now();
+    // Request size in raw characters — a tokenizer-independent proxy for
+    // prompt cost, logged alongside Groq's real usage numbers so a spike in
+    // either (bigger transcript vs. bigger tool schema) is easy to tell apart.
+    const requestChars = JSON.stringify(messages).length + JSON.stringify(tools).length;
     const completion = await createCompletionWithRetry({
       model: config.groqModel,
       reasoning_effort: "low",
@@ -36,8 +48,9 @@ export async function runToolLoop({
     messages.push(message);
 
     const toolCalls = message.tool_calls || [];
+    const u = completion.usage || {};
     console.log(
-      `[toolLoop] iter=${i} completion=${completionMs}ms toolCalls=${toolCalls.length} names=${toolCalls.map((t) => t.function.name).join(",")}`
+      `[toolLoop] iter=${i} completion=${completionMs}ms reqChars=${requestChars} promptTok=${u.prompt_tokens ?? "?"} reasoningTok=${u.completion_tokens_details?.reasoning_tokens ?? "?"} completionTok=${u.completion_tokens ?? "?"} totalTok=${u.total_tokens ?? "?"} toolCalls=${toolCalls.length} names=${toolCalls.map((t) => t.function.name).join(",")}`
     );
     if (toolCalls.length === 0) {
       return { text: message.content || "", finalArgs: null, finalToolName: null, executedTools };
@@ -63,7 +76,11 @@ export async function runToolLoop({
           return { ...p, isFinal: true };
         }
         try {
-          return { ...p, result: await executeTool(p.toolCall.function.name, p.args) };
+          const result = await executeTool(p.toolCall.function.name, p.args);
+          if (result && typeof result === "object" && result.__endLoop) {
+            return { ...p, isFinal: true, finalToolName: result.kind, result: result.payload, ranForReal: true };
+          }
+          return { ...p, result };
         } catch (err) {
           return { ...p, result: { error: err.message } };
         }
@@ -82,9 +99,12 @@ export async function runToolLoop({
       if (s.isFinal) {
         // Only the first final tool in a batch wins.
         if (finalArgs === null) {
-          finalArgs = s.args;
-          finalToolName = s.toolCall.function.name;
+          finalArgs = s.ranForReal ? s.result : s.args;
+          finalToolName = s.ranForReal ? s.finalToolName : s.toolCall.function.name;
         }
+        // Unlike a model-named final tool (never executed), an __endLoop
+        // sentinel means the tool actually ran — count it as executed.
+        if (s.ranForReal) executedTools.push({ name: s.toolCall.function.name, args: s.args });
         // Still push a tool result so the assistant tool_call isn't left
         // dangling — the conversation is reused on the next turn, and the Groq
         // API rejects a tool_call with no matching tool response.

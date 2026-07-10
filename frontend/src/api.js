@@ -45,12 +45,17 @@ export const api = {
 
   instamartCart: () => request("/api/instamart/cart"),
   instamartChatHistory: () => request("/api/instamart/chat/history"),
-  instamartChatSend: (message, intent) =>
-    request("/api/instamart/chat", {
-      method: "POST",
-      body: JSON.stringify(intent ? { message, intent } : { message }),
-    }),
+  instamartChatSend: (message) =>
+    request("/api/instamart/chat", { method: "POST", body: JSON.stringify({ message }) }),
   instamartChatReset: () => request("/api/instamart/chat/reset", { method: "POST" }),
+
+  // Deterministic actions — bypass the chat/LLM loop entirely for
+  // interactions with only one correct outcome (see instamartAgent.js).
+  instamartAddItem: (spinId, skuId, quantity, displayText) =>
+    request("/api/instamart/add-item", { method: "POST", body: JSON.stringify({ spinId, skuId, quantity, displayText }) }),
+  instamartShowMore: () => request("/api/instamart/show-more", { method: "POST" }),
+  instamartClearCart: () => request("/api/instamart/clear-cart", { method: "POST" }),
+  instamartReorderUsuals: () => request("/api/instamart/reorder-usuals", { method: "POST" }),
 };
 
 export { ApiError };

@@ -951,9 +951,37 @@ button:disabled {
   transform: translateY(-2px);
 }
 
+.product-card-imgwrap {
+  position: relative;
+}
+
 .product-card-img {
   width: 100%;
   aspect-ratio: 1 / 1;
+}
+
+/* out-of-stock: dim the photo, badge it, and the Add button is disabled */
+.product-card--oos .product-card-img {
+  opacity: 0.4;
+  filter: grayscale(0.6);
+}
+
+.oos-badge {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  background: var(--text-dark);
+  color: #fff;
+  font-size: 0.68rem;
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: 6px;
+  letter-spacing: 0.02em;
+}
+
+.product-card--oos .product-card-name,
+.product-card--oos .product-card-price {
+  color: var(--text-muted);
 }
 
 .product-card-body {

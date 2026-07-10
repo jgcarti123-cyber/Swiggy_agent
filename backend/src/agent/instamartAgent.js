@@ -6,42 +6,46 @@ import { runToolLoop } from "./toolLoop.js";
 // model's own tool-call result or text summary.
 const CART_TOUCHING_TOOLS = new Set(["update_cart", "checkout", "clear_cart"]);
 
-// Turn-ending tools: instead of feeding a result back to the model, their args
-// render UI (clickable choices / product cards) and hand control to the user.
-const FINAL_TOOLS = ["ask_choice", "present_products"];
+// How many variant cards to show per screen (initial results + each "show
+// more" page).
+const VARIANTS_PER_PAGE = 6;
 
 // The delivery addressId is resolved server-side (from the saved address the
 // user picked in the UI) and injected into every tool call — the model never
 // sees, asks for, or reasons about an address.
+//
+// Deliberately short: this agent no longer asks the model to decide whether
+// to ask a clarifying question or present results — search_products always
+// ends in one of those two outcomes, decided in code (see runSearchAndBranch)
+// from the real result count, not model judgment. That cut the guided-search
+// path from 2-3 Groq completions per turn down to 1 (or 0 for a brand
+// follow-up / card click — see the *Direct functions below), which is what
+// actually fixed the latency: measured completions were taking 20-40s+ each
+// despite tiny outputs, consistent with Groq's free-tier per-minute token
+// quota queuing as a session's cumulative usage climbs — fewer, smaller
+// completions is the lever that matters, more than shrinking any one of them.
 const SYSTEM_PROMPT = `You are Pantry Pal, a grocery assistant for Swiggy Instamart in a single-user dashboard. The delivery address is already set — never ask for it; it is added to every tool call automatically.
 
-How to help the user fill their cart:
-- If the user names a specific product AND size (e.g. "Amul Taaza 500 ml milk"), search_products then add it directly with update_cart.
-- If the user names a broad category (e.g. "milk", "shampoo", "chips"), first call search_products to see what's actually available, then call ask_choice to ask which brand or type they want — offer the real brands/types from the results (see brandsAvailable) as options.
-- After the user picks a brand/type, call search_products again narrowed to it (e.g. "amul milk"), then call present_products with up to 6 real variants (spinId + skuId from that search) so the user can pick the exact size/price. Order the most relevant or cheapest first.
-- Only keep asking with ask_choice while the request is genuinely ambiguous — one or two rounds is plenty, never interrogate.
-
-Cart rules:
-- To add or remove ANY item you MUST actually call update_cart — never reply that you added/removed something without calling it. update_cart REPLACES the whole cart (it is not additive), so first call get_cart and send back the full merged item list, keeping the items you are not changing.
-- Add the specific variant (spinId + skuId), not the parent product. If the user's message already contains a spinId/skuId, use those directly and skip re-searching.
-- Never call checkout unless the user has explicitly confirmed the order in this chat. For Cash on Delivery, confirm first then paymentMethod="Cash"; for UPI, call get_payment_options first.
-- Keep text replies short — product cards and the live cart show separately, so don't restate them in full.`;
+- To find or add a product, call search_products with the best search term for what the user described (e.g. "milk", "chocolate cookies", "amul milk"). The app automatically shows the user a brand choice or product cards right after your search — you never need to ask which brand or list results yourself, just search.
+- For anything that isn't a fresh product search — removing an item, changing a quantity, clearing part of the cart, checking out — call get_cart first to see what's actually there, then update_cart with the full merged item list. You MUST actually call update_cart to make a change; never say you changed the cart without calling it.
+- Never call checkout unless the user has explicitly confirmed in this chat. For Cash on Delivery, confirm first then paymentMethod="Cash"; for UPI, call get_payment_options first.
+- Keep replies short — cards and the live cart render separately, don't restate them.`;
 
 // Address parameters are intentionally omitted from these schemas: the server
 // injects the addressId, so the model shouldn't spend tokens producing it or
-// risk getting it wrong.
+// risk getting it wrong. ask_choice/present_products from the earlier design
+// are gone entirely — see runSearchAndBranch.
 const TOOLS = [
   {
     type: "function",
     function: {
       name: "search_products",
       description:
-        "Search Instamart products. Returns products grouped with variants (spinId/skuId, size, price) plus a brandsAvailable summary. Add the specific variant to cart, not the parent product.",
+        "Search Instamart products for what the user wants. The result is shown to the user automatically (as a brand question or product cards) — just pick a good search term, nothing else to do after calling this.",
       parameters: {
         type: "object",
         properties: {
           query: { type: "string", description: "Product name, category, or brand" },
-          offset: { type: "number", description: "Pagination offset, default 0" },
         },
         required: ["query"],
       },
@@ -50,58 +54,8 @@ const TOOLS = [
   {
     type: "function",
     function: {
-      name: "ask_choice",
-      description:
-        "Ask the user ONE short clarifying question with clickable options, when their request is a broad category spanning multiple brands or types. Call search_products first so the options are real (e.g. the brands that actually carry the item). Do NOT use when the user already named a specific product and size.",
-      parameters: {
-        type: "object",
-        properties: {
-          question: { type: "string", description: "The question to show, e.g. 'Which brand of milk?'" },
-          options: {
-            type: "array",
-            items: { type: "string" },
-            description: "2-8 short option labels (e.g. brand names)",
-          },
-        },
-        required: ["question", "options"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "present_products",
-      description:
-        "Show the user specific product variants as cards (photo, size, price, Add button) so they can pick which to add. Call after narrowing to a brand/type. Provide spinId and skuId (from search_products) for each; up to 6, most relevant or cheapest first.",
-      parameters: {
-        type: "object",
-        properties: {
-          intro: {
-            type: "string",
-            description: "One short line introducing the options, e.g. \"Here are Amul's milk options:\"",
-          },
-          items: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                spinId: { type: "string" },
-                skuId: { type: "string" },
-                note: { type: "string", description: "Optional one-line highlight" },
-              },
-              required: ["spinId", "skuId"],
-            },
-          },
-        },
-        required: ["intro", "items"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
       name: "get_cart",
-      description: "Get the current Instamart cart with items and bill breakdown.",
+      description: "Get the current Instamart cart with items and total.",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -143,8 +97,8 @@ const TOOLS = [
     type: "function",
     function: {
       name: "your_go_to_items",
-      description: "Get the user's frequently/recently ordered items for quick reorder.",
-      parameters: { type: "object", properties: { offset: { type: "number" } } },
+      description: "Get the user's frequently/recently ordered items — use only when they ask about their order history, not for a normal reorder request.",
+      parameters: { type: "object", properties: {} },
     },
   },
   {
@@ -176,8 +130,8 @@ const TOOLS = [
 // ---------------------------------------------------------------------------
 // Product cache — the image side-channel. search_products returns imageUrl per
 // variant, but images are stripped before the model sees results (tokens). So
-// the full variant records are stashed here keyed by id, and present_products
-// / the frontend join photos + price back by spinId. The model never handles
+// the full variant records are stashed here keyed by id, and product cards /
+// the frontend join photos + price back by spinId. The model never handles
 // image URLs.
 // ---------------------------------------------------------------------------
 const productBySpin = new Map();
@@ -185,8 +139,6 @@ const productBySku = new Map();
 
 function cacheProducts(raw) {
   const products = Array.isArray(raw?.products) ? raw.products : [];
-  // Keep the cache from growing without bound across a long session — it only
-  // needs the current interaction's results, so a periodic reset is harmless.
   if (productBySpin.size > 500) {
     productBySpin.clear();
     productBySku.clear();
@@ -212,37 +164,190 @@ function cacheProducts(raw) {
   }
 }
 
+// Only offer a brand as a choice if it has at least one in-stock variant —
+// otherwise picking it leads straight to a screen of unbuyable, greyed-out
+// items. Swiggy's search freely returns out-of-stock products mixed in.
 function distinctBrands(raw) {
   const products = Array.isArray(raw?.products) ? raw.products : [];
   const seen = new Set();
   const brands = [];
   for (const p of products) {
+    const hasInStock = (p.variations || []).some((v) => v.isInStockAndAvailable !== false);
+    if (!hasInStock) continue;
     const b = p.brand || p.variations?.[0]?.brandName;
     if (b && !seen.has(b)) {
       seen.add(b);
       brands.push(b);
     }
   }
-  return brands.slice(0, 10);
+  return brands.slice(0, 8);
 }
 
-// Resolve the model's picked refs back to full cards (with photo + price) from
-// the cache. Unknown ids are dropped so a hallucinated ref never renders.
-function enrichProducts(items) {
+// Every variant across every product, in the order Swiggy's own search
+// already returned them — used as-is rather than re-ranked, per the decision
+// to trust Swiggy's relevance/popularity ordering instead of spending an
+// LLM call to "judge" the same thing from just a name and a price. Brand is
+// kept alongside each ref so a brand follow-up (see runSearchAndBranch) can
+// filter to it — Swiggy's search stays fuzzy even for a brand-qualified
+// query ("amul milk" still returns Chitale, Gokul, etc as loose matches), so
+// re-checking brand count on those results would wrongly ask again.
+function flattenVariants(raw) {
+  const products = Array.isArray(raw?.products) ? raw.products : [];
   const out = [];
-  for (const it of items || []) {
-    const card = productBySpin.get(String(it.spinId)) || productBySku.get(String(it.skuId));
-    if (!card) continue;
-    out.push({ ...card, note: it.note || null });
+  for (const p of products) {
+    const brand = p.brand || p.variations?.[0]?.brandName || null;
+    for (const v of p.variations || []) {
+      if (!v.spinId) continue;
+      out.push({
+        spinId: String(v.spinId),
+        skuId: v.skuId ? String(v.skuId) : null,
+        brand: v.brandName || brand,
+        inStock: v.isInStockAndAvailable !== false,
+      });
+    }
+  }
+  return out;
+}
+
+// Resolve variant refs back to full cards (with photo + price) from the
+// cache. Unknown ids are dropped so a bad ref never renders.
+function enrichProducts(refs) {
+  const out = [];
+  for (const r of refs || []) {
+    const card = productBySpin.get(String(r.spinId)) || productBySku.get(String(r.skuId));
+    if (card) out.push(card);
   }
   return out;
 }
 
 // ---------------------------------------------------------------------------
-// Token control: product-search results are the biggest sink. Strip heavy
-// media/marketing fields and cap arrays before the compacted result goes into
-// the transcript (re-sent every loop iteration). Defensive by field-name
-// pattern; keeps scalar fields like spinId/skuId/displayName/brand/price.
+// Deterministic search branching — the core latency/token fix. Runs the real
+// Swiggy search, then decides ask-vs-show purely from the result shape (brand
+// count), no LLM involved. Called both from the tool-loop (when the model
+// calls search_products) and directly (the zero-LLM brand-follow-up path in
+// sendMessage), so the two entry points always behave identically.
+// ---------------------------------------------------------------------------
+let pendingBrandChoice = null; // { originalQuery, brandsOffered: string[] } | null
+let lastSearchContext = null; // { query, allVariants, shown } | null — for "show more"
+
+// `forceBrand`, when set, means the user already answered "which brand" —
+// there is nothing left to ask, no matter how many other brands Swiggy's
+// fuzzy search mixes into these particular results. Filter down to the
+// confirmed brand and go straight to variants.
+async function runSearchAndBranch(query, addressId, { forceBrand } = {}) {
+  const raw = await instamartClient.searchProducts({ query, addressId });
+  cacheProducts(raw);
+  let variants = flattenVariants(raw);
+
+  if (forceBrand) {
+    const target = forceBrand.toLowerCase();
+    const filtered = variants.filter((v) => (v.brand || "").toLowerCase() === target);
+    // If nothing matched exactly (brand-name casing/variant mismatch), fall
+    // back to the unfiltered set rather than reporting a false "not found".
+    if (filtered.length > 0) variants = filtered;
+  }
+
+  // Lead with buyable items — out-of-stock variants sink to the end (shown
+  // marked/disabled only if they'd otherwise fill empty slots). Array.sort is
+  // stable, so Swiggy's own ordering is preserved within each group.
+  variants = [...variants].sort((a, b) => (b.inStock ? 1 : 0) - (a.inStock ? 1 : 0));
+
+  if (variants.length === 0) {
+    pendingBrandChoice = null;
+    return { kind: "empty", payload: { query } };
+  }
+
+  if (!forceBrand) {
+    const brands = distinctBrands(raw);
+    if (brands.length >= 2) {
+      pendingBrandChoice = { originalQuery: query, brandsOffered: brands };
+      return { kind: "choice", payload: { question: `Which brand of ${query} would you like?`, options: brands } };
+    }
+  }
+
+  pendingBrandChoice = null;
+  const shown = variants.slice(0, VARIANTS_PER_PAGE);
+  lastSearchContext = { query, allVariants: variants, shown: shown.length };
+  return {
+    kind: "products",
+    payload: { intro: `Here's what I found for "${query}":`, items: enrichProducts(shown) },
+  };
+}
+
+function matchOfferedBrand(userText, brandsOffered) {
+  const t = userText.trim().toLowerCase();
+  if (!t) return null;
+  for (const b of brandsOffered) if (b.toLowerCase() === t) return b;
+  for (const b of brandsOffered) {
+    const bl = b.toLowerCase();
+    if (t.includes(bl) || bl.includes(t)) return b;
+  }
+  return null;
+}
+
+// A get_cart failure over ONE item's stock state can "poison" the cart
+// permanently — every subsequent read (including the one every add/reorder
+// below starts with) fails identically until the cart is cleared. Confirmed
+// live: clear_cart succeeds even while get_cart is stuck this way, and reads
+// work normally again immediately after. Surface that as a concrete next
+// step rather than leaving the user staring at Swiggy's raw error text with
+// no way to self-recover.
+// Maps Swiggy's raw tool errors to a short, actionable phrase that completes
+// the sentence "Couldn't add X — ...". Swiggy's own text is verbose (multi-line
+// with report ids/support email) and, for some errors, not user-actionable.
+// Notably, some fresh-meat items report as fully in-stock in search yet
+// update_cart rejects them ("No valid items in cart" / "An error occurred") —
+// confirmed unpredictable from the search data, so those just get a clean
+// "not available, try another" rather than a raw dump.
+function friendlyCartError(err) {
+  const first = String(err.message || "").split("\n")[0].trim();
+  if (/partially available/i.test(first)) {
+    return `the cart may be stuck — tap "Clear cart" below to reset it, then try again.`;
+  }
+  if (/out of stock/i.test(first)) {
+    return "it's out of stock right now — try another option.";
+  }
+  if (/no valid items|not serviceable|cannot be added|couldn'?t be added|an error occurred|unavailable/i.test(first)) {
+    return "Swiggy isn't letting this one be added right now — try a different size or brand.";
+  }
+  return first || "something went wrong — try again.";
+}
+
+// ---------------------------------------------------------------------------
+// Cart merge — shared by the deterministic direct-add/reorder actions below.
+// update_cart replaces the whole cart, so always read the real current
+// contents first and fold the new item(s) in by spinId+skuId.
+// ---------------------------------------------------------------------------
+async function mergeAndUpdateCart(addressId, newItems) {
+  // The whole body is wrapped, not just updateCart: observed live, Swiggy's
+  // get_cart itself can throw "Item quantity is partially available" (a
+  // stock-validation check on the EXISTING cart, not something caused by
+  // this call) — from the very first read below, before update_cart is even
+  // reached. Whatever step fails, always attempt one more resync so the
+  // caller reports the real cart state instead of a stale/null guess.
+  try {
+    const current = await instamartClient.getCartOrEmpty();
+    const merged = new Map();
+    for (const i of current.items || []) {
+      merged.set(`${i.spinId}:${i.skuId}`, { spinId: i.spinId, skuId: i.skuId, quantity: i.quantity });
+    }
+    for (const ni of newItems) {
+      const key = `${ni.spinId}:${ni.skuId}`;
+      const existing = merged.get(key);
+      merged.set(key, { spinId: ni.spinId, skuId: ni.skuId, quantity: (existing?.quantity || 0) + (ni.quantity || 1) });
+    }
+    await instamartClient.updateCart({ selectedAddressId: addressId, items: [...merged.values()] });
+    return instamartClient.getCartOrEmpty();
+  } catch (err) {
+    err.cart = await instamartClient.getCartOrEmpty().catch(() => null);
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Token control for the LLM tool-calling path (still used for free-text cart
+// edits and "your go-to items" questions — the cases that genuinely need the
+// model to read data and reason, unlike the deterministic paths above).
 // ---------------------------------------------------------------------------
 const HEAVY_KEY =
   /image|img|url|photo|thumb|icon|banner|desc|gif|video|media|analytics|tracking|widget|meta|badge|review|offer_?text|coupon/i;
@@ -264,11 +369,26 @@ function compactForModel(value, maxArray) {
 function compactSearchResult(raw) {
   let compacted = compactForModel(raw, 6);
   if (JSON.stringify(compacted).length > 6000) compacted = compactForModel(raw, 3);
-  const brands = distinctBrands(raw);
-  if (brands.length && compacted && typeof compacted === "object") {
-    compacted.brandsAvailable = brands;
-  }
   return compacted;
+}
+
+// get_cart/update_cart's raw response carries a lot the model never needs to
+// reason about a cart edit — full delivery-address details, formatted bill
+// line items, store ids. Confirmed live: this alone was ~500-2000+ chars of
+// dead weight per call, re-sent on every subsequent completion in the turn.
+function compactCartForModel(raw) {
+  if (!raw || typeof raw !== "object") return raw;
+  const items = Array.isArray(raw.items) ? raw.items : [];
+  return {
+    items: items.map((i) => ({
+      spinId: i.spinId,
+      skuId: i.skuId,
+      itemName: i.itemName,
+      quantity: i.quantity,
+      price: i.discountedFinalPrice ?? i.mrp ?? null,
+    })),
+    total: raw.cartTotalAmount ?? raw.billBreakdown?.toPay?.value ?? null,
+  };
 }
 
 // executeTool is built per-request as a closure over the resolved addressId,
@@ -277,19 +397,18 @@ function makeExecuteTool(addressId) {
   return async (name, args) => {
     switch (name) {
       case "search_products": {
-        const raw = await instamartClient.searchProducts({ ...args, addressId });
-        cacheProducts(raw);
-        return compactSearchResult(raw);
+        const { kind, payload } = await runSearchAndBranch(args.query, addressId);
+        return { __endLoop: true, kind, payload };
       }
       case "your_go_to_items": {
-        const raw = await instamartClient.yourGoToItems({ ...args, addressId });
+        const raw = await instamartClient.yourGoToItems({ addressId });
         cacheProducts(raw);
         return compactSearchResult(raw);
       }
-      case "update_cart":
-        return instamartClient.updateCart({ selectedAddressId: addressId, items: args.items });
       case "get_cart":
-        return instamartClient.getCart();
+        return compactCartForModel(await instamartClient.getCart());
+      case "update_cart":
+        return compactCartForModel(await instamartClient.updateCart({ selectedAddressId: addressId, items: args.items }));
       case "clear_cart":
         return instamartClient.clearCart();
       case "get_payment_options":
@@ -303,8 +422,10 @@ function makeExecuteTool(addressId) {
 }
 
 // ---------------------------------------------------------------------------
-// Two transcripts: `conversation` is what the LLM sees (compact, tool-shaped);
-// `displayTranscript` is what the UI renders (rich choice/product messages).
+// Two transcripts: `conversation` is what the LLM sees (compact, tool-shaped,
+// only touched by the LLM tool-loop path); `displayTranscript` is what the UI
+// renders (rich choice/product messages), updated by every path including
+// the zero-LLM deterministic ones.
 // ---------------------------------------------------------------------------
 let conversation = [{ role: "system", content: SYSTEM_PROMPT }];
 let displayTranscript = [];
@@ -322,48 +443,69 @@ function trimConversation() {
   if (displayTranscript.length > 40) displayTranscript = displayTranscript.slice(-40);
 }
 
-// userText goes to the LLM; displayText is what the transcript shows the user
-// (they differ when an Add-button click sends explicit ids to the model but a
-// clean label to the transcript).
+// Turns a branch outcome (kind + payload from runSearchAndBranch, or plain
+// text with kind=null) into the UI transcript entry + API response shape —
+// shared by every path (LLM-driven or deterministic) so they render
+// identically regardless of how the answer was produced.
+function buildFromBranch(kind, payload, text) {
+  if (kind === "choice") {
+    const { question, options } = payload;
+    return {
+      entry: { role: "assistant", type: "choice", question, options },
+      responsePayload: { reply: "", choice: { question, options } },
+    };
+  }
+  if (kind === "products") {
+    const { intro, items } = payload;
+    if (items && items.length > 0) {
+      return {
+        entry: { role: "assistant", type: "products", intro, products: items },
+        responsePayload: { reply: "", products: { intro, items } },
+      };
+    }
+    const fallback = "I couldn't pull those options up — mind trying again?";
+    return { entry: { role: "assistant", text: fallback }, responsePayload: { reply: fallback } };
+  }
+  if (kind === "empty") {
+    const reply = `Couldn't find anything for "${payload.query}" — want to try a different search?`;
+    return { entry: { role: "assistant", text: reply }, responsePayload: { reply } };
+  }
+  const reply = text || "(no reply)";
+  return { entry: { role: "assistant", text: reply }, responsePayload: { reply } };
+}
+
+// userText goes to the LLM; displayText is what the transcript shows the user.
 export async function sendMessage(userText, addressId, displayText = userText) {
-  conversation.push({ role: "user", content: userText });
   displayTranscript.push({ role: "user", text: displayText });
+
+  // Deterministic brand follow-up: the previous turn asked "which brand?"
+  // with a real, closed set of options, so if this message names one of
+  // them there is exactly one correct action — search narrowed to it. No
+  // ambiguity to resolve, so no reason to spend a Groq call resolving it.
+  if (pendingBrandChoice) {
+    const matched = matchOfferedBrand(userText, pendingBrandChoice.brandsOffered);
+    if (matched) {
+      const { kind, payload } = await runSearchAndBranch(`${matched} ${pendingBrandChoice.originalQuery}`, addressId, {
+        forceBrand: matched,
+      });
+      const { entry, responsePayload } = buildFromBranch(kind, payload, "");
+      displayTranscript.push(entry);
+      trimConversation();
+      return { ...responsePayload, cart: null };
+    }
+  }
+
+  conversation.push({ role: "user", content: userText });
 
   const { text, finalArgs, finalToolName, executedTools } = await runToolLoop({
     messages: conversation,
     tools: TOOLS,
     executeTool: makeExecuteTool(addressId),
-    finalToolNames: FINAL_TOOLS,
     maxTokens: 1024,
   });
 
-  let responsePayload;
-  let assistantEntry;
-
-  if (finalToolName === "ask_choice") {
-    const question = finalArgs?.question || text || "Which one?";
-    const options = Array.isArray(finalArgs?.options) ? finalArgs.options.filter(Boolean) : [];
-    assistantEntry = { role: "assistant", type: "choice", question, options };
-    responsePayload = { reply: text || "", choice: { question, options } };
-  } else if (finalToolName === "present_products") {
-    const products = enrichProducts(finalArgs?.items);
-    const intro = finalArgs?.intro || text || "Here are some options:";
-    if (products.length > 0) {
-      assistantEntry = { role: "assistant", type: "products", intro, products };
-      responsePayload = { reply: text || "", products: { intro, items: products } };
-    } else {
-      // Cache miss / bad refs — fall back to plain text rather than an empty grid.
-      const fallback = text || "I couldn't pull those options up — mind trying again?";
-      assistantEntry = { role: "assistant", text: fallback };
-      responsePayload = { reply: fallback };
-    }
-  } else {
-    const reply = text || "(no reply)";
-    assistantEntry = { role: "assistant", text: reply };
-    responsePayload = { reply };
-  }
-
-  displayTranscript.push(assistantEntry);
+  const { entry, responsePayload } = buildFromBranch(finalToolName, finalArgs, text);
+  displayTranscript.push(entry);
   trimConversation();
 
   let liveCart = null;
@@ -380,9 +522,125 @@ export async function sendMessage(userText, addressId, displayText = userText) {
   return { ...responsePayload, cart: liveCart };
 }
 
+// ---------------------------------------------------------------------------
+// Deterministic direct actions — no Groq call at all. These back the UI
+// affordances that only ever have one correct outcome once you know the
+// input: clicking Add on a specific card, "show more", "reorder my usuals",
+// "clear cart". Previously these went through the full chat loop (get_cart +
+// update_cart + a reply completion — measured 3 Groq calls / ~100s for a
+// single card click); now they're a couple of MCP network calls, typically
+// under 2 seconds.
+// ---------------------------------------------------------------------------
+export async function addItemDirect({ spinId, skuId, quantity = 1, addressId, displayText }) {
+  displayTranscript.push({ role: "user", text: displayText });
+  const card = productBySpin.get(String(spinId)) || productBySku.get(String(skuId));
+  const name = card?.displayName || "the item";
+  let reply;
+  let cart = null;
+
+  // Refuse out-of-stock items up front. Swiggy rejects update_cart wholesale
+  // if any item is out of stock ("All items in your cart are currently out of
+  // stock"), which would also risk leaving the cart in a bad state — so never
+  // even attempt it. The UI already marks these, but the button click is
+  // guarded here too as the source of truth.
+  if (card && card.inStock === false) {
+    reply = `${name} is out of stock right now — pick another option.`;
+    displayTranscript.push({ role: "assistant", text: reply });
+    trimConversation();
+    return { reply, cart: null };
+  }
+
+  try {
+    cart = await mergeAndUpdateCart(addressId, [{ spinId, skuId, quantity }]);
+    reply = `Added ${name} to your cart ✓`;
+  } catch (err) {
+    reply = `Couldn't add ${name} — ${friendlyCartError(err)}`;
+    cart = err.cart ?? null;
+  }
+  displayTranscript.push({ role: "assistant", text: reply });
+  trimConversation();
+  return { reply, cart };
+}
+
+export async function showMoreDirect({ addressId, displayText = "Show more options" }) {
+  displayTranscript.push({ role: "user", text: displayText });
+  let entry;
+  let responsePayload;
+
+  if (!lastSearchContext || lastSearchContext.shown >= lastSearchContext.allVariants.length) {
+    const reply = lastSearchContext
+      ? `That's everything I found for "${lastSearchContext.query}".`
+      : "Search for something first and I can show more once there's more to see.";
+    entry = { role: "assistant", text: reply };
+    responsePayload = { reply };
+  } else {
+    const next = lastSearchContext.allVariants.slice(
+      lastSearchContext.shown,
+      lastSearchContext.shown + VARIANTS_PER_PAGE
+    );
+    lastSearchContext.shown += next.length;
+    const items = enrichProducts(next);
+    const intro = "A few more options:";
+    entry = { role: "assistant", type: "products", intro, products: items };
+    responsePayload = { reply: "", products: { intro, items } };
+  }
+
+  displayTranscript.push(entry);
+  trimConversation();
+  return { ...responsePayload, cart: null };
+}
+
+export async function clearCartDirect({ addressId, displayText = "Clear my cart" }) {
+  displayTranscript.push({ role: "user", text: displayText });
+  let reply;
+  let cart = null;
+  try {
+    await instamartClient.clearCart();
+    cart = await instamartClient.getCartOrEmpty();
+    reply = "Your cart is now empty.";
+  } catch (err) {
+    reply = `Couldn't clear the cart — ${String(err.message || "").split("\n")[0]}`;
+  }
+  displayTranscript.push({ role: "assistant", text: reply });
+  trimConversation();
+  return { reply, cart };
+}
+
+export async function reorderUsualsDirect({ addressId, displayText = "Reorder my usual items" }) {
+  displayTranscript.push({ role: "user", text: displayText });
+  let reply;
+  let cart = null;
+  try {
+    const raw = await instamartClient.yourGoToItems({ addressId });
+    cacheProducts(raw);
+    // Only reorder in-stock items — including an out-of-stock one would make
+    // Swiggy reject the whole update_cart (see addItemDirect).
+    const variants = flattenVariants(raw)
+      .filter((v) => v.inStock !== false)
+      .slice(0, 8);
+    if (variants.length === 0) {
+      reply = "None of your usual items are in stock right now — try again later.";
+    } else {
+      cart = await mergeAndUpdateCart(
+        addressId,
+        variants.map((v) => ({ ...v, quantity: 1 }))
+      );
+      reply = `Added ${variants.length} of your usual items to your cart ✓`;
+    }
+  } catch (err) {
+    reply = `Couldn't reorder your usuals — ${friendlyCartError(err)}`;
+    cart = err.cart ?? null;
+  }
+  displayTranscript.push({ role: "assistant", text: reply });
+  trimConversation();
+  return { reply, cart };
+}
+
 export function resetConversation() {
   conversation = [{ role: "system", content: SYSTEM_PROMPT }];
   displayTranscript = [];
+  pendingBrandChoice = null;
+  lastSearchContext = null;
 }
 
 export function getConversationForDisplay() {
