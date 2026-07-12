@@ -572,6 +572,22 @@ function friendlyCartError(err) {
 // update_cart replaces the whole cart, so always read the real current
 // contents first and fold the new item(s) in by spinId+skuId.
 // ---------------------------------------------------------------------------
+
+// Confirmed live: Swiggy's update_cart can return a normal success response
+// while silently NOT including a specific item in the resulting cart — no
+// error thrown at all, so nothing downstream would notice without explicitly
+// checking. These two helpers let every add path verify the real cart state
+// instead of trusting "the call didn't throw" as proof an item landed.
+function itemKey(spinId, skuId) {
+  return `${spinId}:${skuId}`;
+}
+
+function keysInCart(cart) {
+  const set = new Set();
+  for (const i of cart?.items || []) set.add(itemKey(i.spinId, i.skuId));
+  return set;
+}
+
 async function mergeAndUpdateCart(addressId, newItems) {
   // The whole body is wrapped, not just updateCart: observed live, Swiggy's
   // get_cart itself can throw "Item quantity is partially available" (a
@@ -851,7 +867,20 @@ export async function addItemDirect({ spinId, skuId, quantity = 1, addressId, di
 
   try {
     cart = await mergeAndUpdateCart(addressId, [{ spinId, skuId, quantity }]);
-    reply = `Added ${name} to your cart ✓`;
+    let landed = keysInCart(cart).has(itemKey(spinId, skuId));
+    if (!landed) {
+      // Swiggy can report update_cart success while silently dropping this
+      // specific item — confirmed live, reproducible for a given item/store
+      // combo, no error thrown to catch. One retry mirrors the "retry once"
+      // policy update_cart already gets for thrown failures
+      // (instamartClient.js's callWithRetry) — extending the same tolerance
+      // to a silent drop, which that layer has no way to see.
+      cart = await mergeAndUpdateCart(addressId, [{ spinId, skuId, quantity }]);
+      landed = keysInCart(cart).has(itemKey(spinId, skuId));
+    }
+    reply = landed
+      ? `Added ${name} to your cart ✓`
+      : `Couldn't add ${name} — Swiggy isn't letting this one be added right now, try again later.`;
   } catch (err) {
     rethrowIfReauth(err);
     reply = `Couldn't add ${name} — ${friendlyCartError(err)}`;
@@ -916,42 +945,58 @@ export async function clearCartDirect({ addressId, displayText = "Clear my cart"
 // badge — §6.9 — that's a separate, live signal.)
 // ---------------------------------------------------------------------------
 
-// Merge a set of items into the cart, tolerant of individual failures. Fast
-// path is one batch update_cart; only if that fails (typically because one
-// item went out of stock and Swiggy rejects the whole batch — §6.5) does it
-// fall back to adding items one at a time so the good ones still land. Used by
-// both "Reorder now" and the scheduler. Reauth errors propagate untouched.
+// Merge a set of items into the cart, tolerant of individual failures, and
+// tolerant of Swiggy's own silent ones. Fast path is one batch update_cart;
+// if that THROWS (typically the whole batch rejected — §6.5), or if it
+// succeeds but the resulting cart is quietly missing an item Swiggy never
+// complained about (confirmed live: a 4-item batch update_cart returned
+// success with no error, yet the cart afterward only had 3 of the 4 items —
+// a different, more dangerous failure mode than the documented "whole batch
+// rejected" one, because nothing here would have signaled a problem without
+// checking) — either way, only the items actually missing get retried one at
+// a time, and `added`/`failed` are always computed from the FINAL cart's real
+// contents, never assumed from whether a call threw. Used by both "Reorder
+// now" and the scheduler. Reauth errors propagate untouched.
 async function addUsualsBestEffort(addressId, items) {
+  let cart = null;
+  let missing = items;
   try {
-    const cart = await mergeAndUpdateCart(addressId, items);
-    return { cart, added: items.length, failed: 0 };
+    cart = await mergeAndUpdateCart(addressId, items);
+    const present = keysInCart(cart);
+    missing = items.filter((it) => !present.has(itemKey(it.spinId, it.skuId)));
   } catch (err) {
     if (err instanceof NeedsReauthError) throw err;
-    const current = await instamartClient.getCartOrEmpty();
-    const merged = new Map();
-    for (const i of current.items || []) {
-      merged.set(`${i.spinId}:${i.skuId}`, { spinId: i.spinId, skuId: i.skuId, quantity: i.quantity });
-    }
-    let added = 0;
-    let failed = 0;
-    for (const it of items) {
-      const key = `${it.spinId}:${it.skuId}`;
-      const trial = new Map(merged);
-      const existing = trial.get(key);
-      trial.set(key, { spinId: it.spinId, skuId: it.skuId, quantity: (existing?.quantity || 0) + (it.quantity || 1) });
-      try {
-        await instamartClient.updateCart({ selectedAddressId: addressId, items: [...trial.values()] });
-        merged.clear();
-        for (const [k, v] of trial) merged.set(k, v);
-        added++;
-      } catch (e) {
-        if (e instanceof NeedsReauthError) throw e;
-        failed++;
-      }
-    }
-    const cart = await instamartClient.getCartOrEmpty().catch(() => null);
-    return { cart, added, failed };
+    cart = await instamartClient.getCartOrEmpty().catch(() => null);
   }
+
+  if (missing.length === 0) {
+    return { cart, added: items.length, failed: 0 };
+  }
+
+  const current = (await instamartClient.getCartOrEmpty().catch(() => cart)) || { items: [] };
+  const merged = new Map();
+  for (const i of current.items || []) {
+    merged.set(itemKey(i.spinId, i.skuId), { spinId: i.spinId, skuId: i.skuId, quantity: i.quantity });
+  }
+  for (const it of missing) {
+    const key = itemKey(it.spinId, it.skuId);
+    const trial = new Map(merged);
+    const existing = trial.get(key);
+    trial.set(key, { spinId: it.spinId, skuId: it.skuId, quantity: (existing?.quantity || 0) + (it.quantity || 1) });
+    try {
+      await instamartClient.updateCart({ selectedAddressId: addressId, items: [...trial.values()] });
+      merged.clear();
+      for (const [k, v] of trial) merged.set(k, v);
+    } catch (e) {
+      if (e instanceof NeedsReauthError) throw e;
+      // Leave `merged` as-is — this item stays out, counted as failed below.
+    }
+  }
+
+  const finalCart = await instamartClient.getCartOrEmpty().catch(() => null);
+  const finalPresent = keysInCart(finalCart);
+  const failed = items.filter((it) => !finalPresent.has(itemKey(it.spinId, it.skuId))).length;
+  return { cart: finalCart, added: items.length - failed, failed };
 }
 
 // Add the entire local usuals list into the cart (merge). Shared by the
