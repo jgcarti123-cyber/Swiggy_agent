@@ -1,5 +1,6 @@
 import { createCompletionWithRetry } from "./groqClient.js";
 import { config } from "../config.js";
+import { NeedsReauthError } from "../auth/oauthClient.js";
 
 // Groq has no server-side tool execution like Anthropic's beta MCP
 // connector — every tool_call the model emits has to be executed here and
@@ -82,6 +83,13 @@ export async function runToolLoop({
           }
           return { ...p, result };
         } catch (err) {
+          // A reauth failure isn't something the model can act on by
+          // rephrasing its reply — feeding it back as tool-result text would
+          // just have the model apologize in the chat instead of the app
+          // surfacing the real "please reconnect" prompt. Let it abort the
+          // whole turn (propagates out of Promise.all, uncaught here, up to
+          // the route and Express's central error handler) instead.
+          if (err instanceof NeedsReauthError) throw err;
           return { ...p, result: { error: err.message } };
         }
       })

@@ -1,5 +1,6 @@
 import { instamartClient } from "../mcp/instamartClient.js";
 import { runToolLoop } from "./toolLoop.js";
+import { NeedsReauthError } from "../auth/oauthClient.js";
 
 // Tool calls that mutate the cart — after any of these fire during a turn,
 // the live cart is re-fetched independently rather than trusting the
@@ -474,6 +475,19 @@ function matchOfferedBrand(userText, brandsOffered) {
   return null;
 }
 
+// Every deterministic direct action below catches broadly so a Swiggy
+// rejection (out of stock, stuck cart, etc.) becomes a friendly chat message
+// instead of a 500. A mid-session auth failure (§mcpClient.js — Swiggy's JWT
+// can expire before the locally tracked 5-day window does) must NOT go
+// through that same path: it's not a cart problem the user can retry their
+// way out of, it needs the app's real "please reconnect" prompt. Call this
+// first in every catch block so it re-throws before any friendly-message
+// building happens — the re-thrown error propagates uncaught up to the route
+// and Express's central handler, which converts it to 401 NEEDS_REAUTH.
+function rethrowIfReauth(err) {
+  if (err instanceof NeedsReauthError) throw err;
+}
+
 // A get_cart failure over ONE item's stock state can "poison" the cart
 // permanently — every subsequent read (including the one every add/reorder
 // below starts with) fails identically until the cart is cleared. Confirmed
@@ -528,7 +542,11 @@ async function mergeAndUpdateCart(addressId, newItems) {
     await instamartClient.updateCart({ selectedAddressId: addressId, items: [...merged.values()] });
     return instamartClient.getCartOrEmpty();
   } catch (err) {
-    err.cart = await instamartClient.getCartOrEmpty().catch(() => null);
+    // No point attempting a resync read when the failure is itself an
+    // expired/missing token — it would just fail identically.
+    if (!(err instanceof NeedsReauthError)) {
+      err.cart = await instamartClient.getCartOrEmpty().catch(() => null);
+    }
     throw err;
   }
 }
@@ -725,6 +743,7 @@ export async function sendMessage(userText, addressId, displayText = userText) {
     try {
       liveCart = await instamartClient.getCartOrEmpty();
     } catch (err) {
+      rethrowIfReauth(err);
       liveCart = { error: err.message };
     }
   }
@@ -764,6 +783,7 @@ export async function addItemDirect({ spinId, skuId, quantity = 1, addressId, di
     cart = await mergeAndUpdateCart(addressId, [{ spinId, skuId, quantity }]);
     reply = `Added ${name} to your cart ✓`;
   } catch (err) {
+    rethrowIfReauth(err);
     reply = `Couldn't add ${name} — ${friendlyCartError(err)}`;
     cart = err.cart ?? null;
   }
@@ -809,6 +829,7 @@ export async function clearCartDirect({ addressId, displayText = "Clear my cart"
     cart = await instamartClient.getCartOrEmpty();
     reply = "Your cart is now empty.";
   } catch (err) {
+    rethrowIfReauth(err);
     reply = `Couldn't clear the cart — ${String(err.message || "").split("\n")[0]}`;
   }
   displayTranscript.push({ role: "assistant", text: reply });
@@ -838,6 +859,7 @@ export async function reorderUsualsDirect({ addressId, displayText = "Reorder my
       reply = `Added ${variants.length} of your usual items to your cart ✓`;
     }
   } catch (err) {
+    rethrowIfReauth(err);
     reply = `Couldn't reorder your usuals — ${friendlyCartError(err)}`;
     cart = err.cart ?? null;
   }
@@ -869,6 +891,7 @@ export async function setItemQuantity({ addressId, spinId, skuId, quantity }) {
     const cart = await instamartClient.getCartOrEmpty();
     return { cart };
   } catch (err) {
+    rethrowIfReauth(err);
     const cart = await instamartClient.getCartOrEmpty().catch(() => null);
     return { cart, error: friendlyCartError(err) };
   }
