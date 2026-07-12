@@ -34,13 +34,6 @@ db.exec(`
     updated_at TEXT NOT NULL
   );
 
-  CREATE TABLE IF NOT EXISTS coupon_cache (
-    restaurant_id TEXT PRIMARY KEY,
-    address_id TEXT NOT NULL,
-    payload_json TEXT NOT NULL,
-    fetched_at INTEGER NOT NULL
-  );
-
   CREATE TABLE IF NOT EXISTS order_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     domain TEXT NOT NULL,
@@ -140,29 +133,6 @@ export function getSavedAddress() {
   const row = db.prepare(`SELECT * FROM saved_address WHERE id = 1`).get();
   if (!row) return null;
   return { ...row, raw: row.raw_json ? JSON.parse(row.raw_json) : null };
-}
-
-// --- Coupon cache (short-TTL, read in Feature 1 to avoid refetching on every keystroke) ---
-const COUPON_CACHE_TTL_MS = 2 * 60 * 1000;
-
-export function cacheCoupons(restaurantId, addressId, payload) {
-  db.prepare(
-    `INSERT INTO coupon_cache (restaurant_id, address_id, payload_json, fetched_at)
-     VALUES (?, ?, ?, ?)
-     ON CONFLICT(restaurant_id) DO UPDATE SET
-       address_id = excluded.address_id,
-       payload_json = excluded.payload_json,
-       fetched_at = excluded.fetched_at`
-  ).run(restaurantId, addressId, JSON.stringify(payload), Date.now());
-}
-
-export function getCachedCoupons(restaurantId, addressId) {
-  const row = db
-    .prepare(`SELECT * FROM coupon_cache WHERE restaurant_id = ? AND address_id = ?`)
-    .get(restaurantId, addressId);
-  if (!row) return null;
-  if (Date.now() - row.fetched_at > COUPON_CACHE_TTL_MS) return null;
-  return JSON.parse(row.payload_json);
 }
 
 // --- Order history (log only, both domains) ---

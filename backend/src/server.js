@@ -55,7 +55,15 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "INTERNAL_ERROR", message: err.message });
 });
 
-app.listen(config.port, () => {
-  console.log(`Swiggy dashboard backend listening on http://localhost:${config.port}`);
+// Bind to loopback ONLY (127.0.0.1), not the default all-interfaces (0.0.0.0).
+// This backend holds the live Swiggy OAuth token and exposes unauthenticated
+// endpoints that add to the cart and place real orders (food /order, and
+// checkout via the Instamart chat). With a 0.0.0.0 bind, any device on the
+// same Wi-Fi/LAN could reach http://<your-ip>:8787 and drive your Swiggy
+// account. Loopback binding makes the server reachable only from this machine
+// (which is all the Vite dev proxy — http://localhost:8787 — needs). This is
+// the single most important line for "no one else can touch my account."
+app.listen(config.port, "127.0.0.1", () => {
+  console.log(`Swiggy dashboard backend listening on http://127.0.0.1:${config.port}`);
   startUsualsScheduler();
 });

@@ -102,7 +102,7 @@ The app already uses Swiggy's signature orange (`#FC8019`) as the primary accent
 
 ## Stack
 
-React + Vite frontend, Node/Express backend, SQLite for local state (OAuth client + token, saved address id, cached menu/coupon lookups — `coupon_cache` is currently dead code, kept for future use, since coupon pricing no longer goes through a cacheable read-only call — order history, the editable `usuals` list, and the `usuals_schedule` row for the daily auto-add). The backend is the only thing that talks to Swiggy MCP and holds the OAuth token; the frontend never calls Swiggy directly. A single interval-based scheduler (`scheduler.js`) also runs in the backend process for the daily usuals auto-add.
+React + Vite frontend, Node/Express backend, SQLite for local state (OAuth client + token, saved address id, order history, the editable `usuals` list, and the `usuals_schedule` row for the daily auto-add). The backend is the only thing that talks to Swiggy MCP and holds the OAuth token; the frontend never calls Swiggy directly. The backend listens on `127.0.0.1` only (loopback), never `0.0.0.0` — it holds the live Swiggy token and exposes unauthenticated cart/order endpoints, so it must not be reachable from other devices on the network. A single interval-based scheduler (`scheduler.js`) also runs in the backend process for the daily usuals auto-add.
 
 ## Non-goals for this build
 

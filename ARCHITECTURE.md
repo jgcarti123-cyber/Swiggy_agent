@@ -435,12 +435,13 @@ Plain React + Vite, no state-management library — each panel owns its own `use
 
 SQLite, `backend/data/app.db` (gitignored — holds the live OAuth token). Single-user design shows up directly in the schema: most tables use `id INTEGER PRIMARY KEY CHECK (id = 1)` — a deliberate "singleton row" pattern (one client registration, one token, one saved address at a time), upserted via `ON CONFLICT(id) DO UPDATE`.
 
+The token never leaves the backend (it's read from SQLite inside `getValidAccessToken()`, only ever sent to Swiggy as a `Bearer` header, never returned in a response or logged), and the Express server binds to **`127.0.0.1` only** (`server.js`), never the default `0.0.0.0`. That binding matters: the API is unauthenticated (a single-user local tool) and includes endpoints that add to the cart and place real orders, so an all-interfaces bind would let any device on the same network drive the account. Loopback binding is the boundary that keeps it to this machine (all the Vite dev proxy needs).
+
 | Table | Purpose |
 |---|---|
 | `oauth_client` | DCR result — `client_id` (+ secret if any), the redirect URI it was registered with |
 | `oauth_token` | The single active access token + its expiry |
 | `saved_address` | The one delivery address both Feast Finder and Pantry Pal use |
-| `coupon_cache` | Dead code — was meant to cache `fetch_food_coupons` results; unused since that tool was confirmed non-functional (§4.7) and coupon pricing moved to an on-demand cart-build flow with nothing cacheable |
 | `order_history` | Append-only log of placed orders — only the food `/order` route logs to this table today; Instamart `checkout` is fully wired and callable from chat (gated by the system prompt's explicit-confirmation rule), it just isn't logged here yet |
 | `usuals` | The local, user-editable reorder list (§6.11) — one row per saved variant (`spin_id`/`sku_id` unique, so re-saving is an idempotent upsert). Autoincrement id, not a singleton, since it's a real list |
 | `usuals_schedule` | Singleton row for the daily auto-add (§6.12): `enabled`, `time` ("HH:MM"), and the scheduler's bookkeeping — `last_run_date` (gates once-per-day + is the priming marker), `last_status`/`last_status_at` (surfaced in the UI) |
