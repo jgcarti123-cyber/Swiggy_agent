@@ -6,6 +6,7 @@ import { foodRouter } from "./routes/food.js";
 import { instamartRouter } from "./routes/instamart.js";
 import { NeedsReauthError } from "./auth/oauthClient.js";
 import { SwiggyToolError } from "./mcp/mcpClient.js";
+import { startUsualsScheduler } from "./scheduler.js";
 
 const app = express();
 app.use(cors({ origin: config.frontendOrigin, credentials: true }));
@@ -56,4 +57,5 @@ app.use((err, req, res, next) => {
 
 app.listen(config.port, () => {
   console.log(`Swiggy dashboard backend listening on http://localhost:${config.port}`);
+  startUsualsScheduler();
 });

@@ -390,6 +390,29 @@ All five update `displayTranscript` directly (so the UI's rich rendering stays c
 
 **Safety valve:** if the filter would remove every result (a query where Swiggy's match was purely semantic, no literal overlap anywhere), it's skipped and the unfiltered set is used instead — the same "don't report a false empty result" principle already used when `forceBrand` doesn't match anything exactly (§6.4).
 
+### 6.11 The editable "usuals" list — local, not Swiggy's
+
+**Why local at all.** The "Reorder my usuals" button originally pulled Swiggy's `your_go_to_items` — but that tool is **read-only**; there is no Swiggy API to add to or remove from that list. As soon as the requirement became "let me edit my usuals," the list had to become the app's own. So there's now a local `usuals` table (`db.js`) that is the source of truth for the reorder button, **completely separate** from `your_go_to_items` (which still, unchanged, powers the "most ordered by you" search badge in §6.9 — that's a live signal, not an editable list; the two coexist deliberately).
+
+**It starts empty** (a product decision — the alternative of seeding once from `your_go_to_items` was considered and rejected in favor of a list the user builds explicitly). The user fills it three ways, two deterministic and one via the model:
+
+- **☆ on any product card** (`saveUsualDirect`) — every card rendered in chat carries a save-to-usuals star. This is how you "add to usuals," and it's why the chat agent itself has no add-to-usuals tool: adding needs a specific variant (brand + pack size), which is exactly what the guided search already resolves. So the agent's job for "add milk to my usuals" is just to *search* — the star on the resulting card does the save. The system prompt says this explicitly.
+- **× in the My Usuals panel** (`removeUsualDirect`) — deterministic remove by exact id.
+- **`remove_from_usuals` chat tool** — the one usuals operation genuinely worth a model round-trip, because "remove the milk" / "take amul off my usuals" is free text that has to be resolved against the current list. Execution is still deterministic: `matchUsualByName` does **token-overlap** matching (not contiguous substring), so "amul milk" matches "Amul Taaza Milky Milk" by scoring how many query words appear in each item's name+brand and taking the best. (`get_usuals` is also exposed so the agent can answer "what's on my usuals list".) When a usuals-editing tool runs, `sendMessage` returns the fresh list alongside the reply so the panel re-renders without a second round-trip — the same pattern as the cart refetch.
+
+**Reordering** (`addUsualsToCart`, shared by the "Reorder now" button, the chat "reorder my usuals", and the scheduler) merges the whole local list into the cart. Because the local list has no live stock data (unlike `your_go_to_items`, which did), it can't pre-filter out-of-stock items — and one out-of-stock item makes Swiggy reject a whole batch `update_cart` (§6.5). So `addUsualsBestEffort` tries the fast batch path first, and **only on failure** falls back to adding items one at a time, so the good items still land and the reply can say "added 4 of 5 — the rest are unavailable." The one-at-a-time path is the slow exception, not the default.
+
+### 6.12 The daily auto-add scheduler
+
+**What it does and, more importantly, what it doesn't.** `scheduler.js` (started from `server.js`, a plain 30-second `setInterval` — no cron dependency for a single-user localhost app with one time-of-day) can automatically merge the usuals list into the cart at a user-chosen time each day. It **only ever adds to the cart. It never checks out**, never touches payment — that stays the explicit user action it always was (project non-goal: "no automated checkout"). This is the whole safety argument: adding to a cart is reversible and idempotent-ish; placing an order is neither, and the existing code already refuses to auto-retry `checkout` for the same reason (§6.6).
+
+**Two hard limits, surfaced rather than hidden.** It only works while (a) the backend process is running and (b) the Swiggy token is still valid (~5-day life, no refresh — §3). Both fail in normal use. Rather than silently lose a run:
+
+- A **grace window** (10 min) distinguishes a normal on-time fire from a late startup. On each tick, if the scheduled minute has passed today and no run is recorded: within the window → run now; past the window → the backend was down at the real time, so record `missed` and **don't catch up** (the user's chosen behavior — a stale auto-order appearing hours later is worse than a skipped one).
+- A run blocked by an expired token records `needs_reauth`; an empty list records `empty`; a partial add records `partial:a/b`. Every status is stamped with its date (`last_run_date` also gates "at most once per day") and surfaced in the My Usuals panel, so a skipped run becomes a visible "reconnect and reorder manually" nudge instead of a silent no-op.
+
+**Priming avoids a false "missed" on setup.** When a schedule is saved, the route stamps today's run-marker based on the chosen time vs. now: if the time already passed today, today is marked `scheduled` (benign, no notice, starts tomorrow); if it's still ahead, the marker is cleared so it can fire later today. Without this, enabling "auto-add at 07:30" at 6pm would immediately trip the grace-window logic and show "missed — the app wasn't running," which is both wrong (it *was* running) and alarming. A new schedule always takes effect from its next real occurrence.
+
 ---
 
 ## 7. Frontend (`frontend/src/`)
@@ -401,8 +424,9 @@ Plain React + Vite, no state-management library — each panel owns its own `use
 - **`api.js`** is a thin `fetch` wrapper (`request(path, options)`) with one piece of shared logic: a 401 (or `error: "NEEDS_REAUTH"`) response throws a typed `ApiError` that callers check with `isReauthError(err)` to show a re-auth prompt instead of a generic error (`ReauthNotice.jsx` is the shared UI for it). It also exposes the deterministic direct-action endpoints (§6.8) as distinct methods alongside `instamartChatSend`.
 - **`AddressPicker.jsx`** — shared between both panels; lists saved addresses via the Food `/api/food/addresses` route and persists the chosen one server-side. Pantry Pal's address bar sits at the top of the panel, not inside the chat itself — the chat agent never asks for an address (§6.2).
 - **`DishCompare.jsx`** — renders the veg/non-veg/all pill toggle, the "surprise me" randomiser button (§4.6), the restaurant list (each item row independently manages its own coupon-check loading/result state), and, on a zero-result search, the "try instead" suggestion chips (§4.5).
-- **`InstamartChat.jsx`** — renders the chat transcript, including two message types beyond plain text: `choice` (clickable brand chips, including the dashed "Any brand" option, §6.4) and `products` (an image-card grid, each with a price and Add button, out-of-stock ones visibly marked and disabled, §6.5). Quick-action chips ("Reorder my usuals," "Clear cart") and each card's "Add" button call the deterministic direct-action endpoints, not the chat endpoint.
+- **`InstamartChat.jsx`** — renders the chat transcript, including two message types beyond plain text: `choice` (clickable brand chips, including the dashed "Any brand" option, §6.4) and `products` (an image-card grid, each with a price, an Add button, and a ☆ save-to-usuals toggle, out-of-stock ones visibly marked and disabled, §6.5/§6.11). Each card's "Add" and ☆ call deterministic direct-action endpoints, not the chat endpoint; a saved item's star fills (★) driven by a `savedKeys` set held in the panel. Owns the usuals + schedule state and renders `UsualsPanel` in the right column under the cart.
 - **`CartSummary.jsx`** — reads the real, confirmed `get_cart` field names directly (`itemName`, `discountedFinalPrice`, `cartTotalAmount`, `imageUrl`, `spinId`, `skuId`), with defensive fallback key names kept in case a field is ever missing. Each line item renders a +/- quantity stepper (§6.8) that calls `/set-quantity` directly — a plain cart edit, not a chat action.
+- **`UsualsPanel.jsx`** — the editable "My Usuals" list (§6.11): saved items with remove ×, a "Reorder now" button, and the daily auto-add controls (enable toggle + `<input type="time">`). Renders the scheduler's last-run status (§6.12) as a warning or muted-confirmation line. All its actions are deterministic direct-action endpoints; the schedule toggle/time save optimistically and reconcile with the server's returned row.
 - **`ProductThumb.jsx`** — a shared image tile (product cards + cart rows) that falls back to a clean placeholder rather than a broken-image icon when a photo is missing or fails to load, matching the same "never fake or drop it" policy Feast Finder's dish photos already used.
 
 ---
@@ -418,8 +442,10 @@ SQLite, `backend/data/app.db` (gitignored — holds the live OAuth token). Singl
 | `saved_address` | The one delivery address both Feast Finder and Pantry Pal use |
 | `coupon_cache` | Dead code — was meant to cache `fetch_food_coupons` results; unused since that tool was confirmed non-functional (§4.7) and coupon pricing moved to an on-demand cart-build flow with nothing cacheable |
 | `order_history` | Append-only log of placed orders — only the food `/order` route logs to this table today; Instamart `checkout` is fully wired and callable from chat (gated by the system prompt's explicit-confirmation rule), it just isn't logged here yet |
+| `usuals` | The local, user-editable reorder list (§6.11) — one row per saved variant (`spin_id`/`sku_id` unique, so re-saving is an idempotent upsert). Autoincrement id, not a singleton, since it's a real list |
+| `usuals_schedule` | Singleton row for the daily auto-add (§6.12): `enabled`, `time` ("HH:MM"), and the scheduler's bookkeeping — `last_run_date` (gates once-per-day + is the priming marker), `last_status`/`last_status_at` (surfaced in the UI) |
 
-Pantry Pal's conversation state (`conversation`, `displayTranscript`, the product image cache, `pendingBrandChoice`, `lastSearchContext`) is deliberately **not** in SQLite — it's in-memory, module-level state in `instamartAgent.js`, reset on server restart or explicit "Reset conversation." Appropriate for a single-user local tool where losing an in-progress chat on restart is a non-issue, and persisting it would add real complexity for no benefit.
+Pantry Pal's conversation state (`conversation`, `displayTranscript`, the product image cache, `pendingBrandChoice`, `lastSearchContext`) is deliberately **not** in SQLite — it's in-memory, module-level state in `instamartAgent.js`, reset on server restart or explicit "Reset conversation." Appropriate for a single-user local tool where losing an in-progress chat on restart is a non-issue, and persisting it would add real complexity for no benefit. The `usuals` list and its schedule, by contrast, **are** persisted — they're durable user config that must survive restarts (and the scheduler reads them fresh from the DB on every tick).
 
 ---
 
@@ -434,7 +460,7 @@ Central pattern in `server.js`: every route is `async`, and Express 5 automatica
 
 This is the *outermost* layer, catching whatever reaches it. Two layers sit underneath it that resolve problems before they ever get here: `mcpClient.js`'s connection-cache invalidation and retry (§2.2, §6.6) handle transport-level failures by reconnecting and retrying transparently, and `instamartAgent.js`'s `friendlyCartError()` (§6.5) turns Swiggy's own raw tool-rejection text into a short, specific message *before* it would otherwise bubble up as a generic 502. By the time an error reaches this middleware, it's already something neither of those layers could recover from.
 
-**A mid-session 401 has to be normalized, and caught in more than one place.** Swiggy's JWT can expire *earlier* than the token's locally-tracked `expires_at` (they're independent — the local check is a cheap gate, not the source of truth). When that happens, the MCP transport throws a raw 401 that isn't a `SwiggyToolError` at all. Critically, this can come from the `getClient()` **connection handshake**, not just the tool call — so `callSwiggyTool` wraps *both* in its try and converts any auth-shaped failure (`invalid_token`, `jwt expired`, 401) into the same `NeedsReauthError` a locally-expired token produces. This was a real bug: with the handshake outside the try, a mid-session expiry surfaced to the user as a raw `"JWT has expired"` dump in the chat instead of the reconnect prompt. And because Pantry Pal's deterministic direct actions and the LLM tool loop both catch broadly (to turn cart rejections into friendly text), each of those catch sites explicitly **re-throws** a `NeedsReauthError` (`rethrowIfReauth` / an `instanceof` check in `toolLoop.js`) rather than flattening it into a "couldn't add that" message — otherwise the normalization would be swallowed one layer below this middleware.
+**A mid-session 401 has to be normalized, and caught in more than one place.** Swiggy's JWT can expire *earlier* than the token's locally-tracked `expires_at` (they're independent — the local check is a cheap gate, not the source of truth). When that happens, the MCP transport throws a raw 401 that isn't a `SwiggyToolError` at all. Critically, this can come from the `getClient()` **connection handshake**, not just the tool call — so `callSwiggyTool` wraps *both* in its try and converts any auth-shaped failure (`invalid_token`, `jwt expired`, 401) into the same `NeedsReauthError` a locally-expired token produces. This was a real bug: with the handshake outside the try, a mid-session expiry surfaced to the user as a raw `"JWT has expired"` dump in the chat instead of the reconnect prompt. And because Pantry Pal's deterministic direct actions and the LLM tool loop both catch broadly (to turn cart rejections into friendly text), each of those catch sites explicitly **re-throws** a `NeedsReauthError` (`rethrowIfReauth` / an `instanceof` check in `toolLoop.js`) rather than flattening it into a "couldn't add that" message — otherwise the normalization would be swallowed one layer below this middleware. The scheduler (§6.12) does the opposite with the same error: it *catches* it and records `needs_reauth`, because a background job has no user to prompt.
 
 The frontend's `api.js` mirrors the 401 case: any 401-shaped response becomes a typed `ApiError` that every panel checks for and renders as a re-auth prompt rather than a generic error message.
 
@@ -467,13 +493,15 @@ The frontend's `api.js` mirrors the 401 case: any 401-shaped response becomes a 
 │      │                  ├── runSearchAndBranch (deterministic, __endLoop) │
 │      │                  ├── Groq (free-text → search query / cart edit)   │
 │      │                  └── instamartClient (MCP: Instamart)              │
-│      └── /add-item, /show-more, /reorder-usuals,                         │
-│          /clear-cart, /set-quantity ─── direct actions, ZERO Groq calls   │
-│                  └── instamartClient (MCP: Instamart, retry-wrapped)      │
+│      ├── /add-item, /show-more, /reorder-usuals, /clear-cart,           │
+│      │   /set-quantity, /usuals* ─── direct actions, ZERO Groq calls      │
+│      │          └── instamartClient (MCP: Instamart, retry-wrapped)       │
+│      └── /usuals/schedule ─── scheduler.js (daily auto-add, add-only)     │
 │                                                                            │
 │  routes/auth.js ─── oauthClient.js (OAuth 2.1 + PKCE + DCR)               │
 │                                                                            │
-│  db.js (SQLite: token, client reg, saved address, order log)             │
+│  db.js (SQLite: token, client reg, saved address, order log,             │
+│          editable usuals list + daily auto-add schedule)                 │
 └───────────┬────────────────────────────────────────────┬─────────────────┘
             │ StreamableHTTP + Bearer token,               │ HTTPS
             │ reconnect-on-network-failure (§2.2)          │ (chat completions)

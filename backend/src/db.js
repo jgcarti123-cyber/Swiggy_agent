@@ -48,6 +48,40 @@ db.exec(`
     summary_json TEXT,
     created_at TEXT NOT NULL
   );
+
+  -- Local, user-editable "usuals" list for Pantry Pal. Deliberately NOT
+  -- Swiggy's your_go_to_items (that tool is read-only — there's no Swiggy API
+  -- to edit it), so the app keeps its own list here. Starts empty; the user
+  -- builds it by saving items found in chat. UNIQUE(spin_id, sku_id) makes a
+  -- re-save of the same variant idempotent.
+  CREATE TABLE IF NOT EXISTS usuals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    spin_id TEXT NOT NULL,
+    sku_id TEXT,
+    name TEXT,
+    brand TEXT,
+    quantity_description TEXT,
+    mrp REAL,
+    offer_price REAL,
+    image_url TEXT,
+    quantity INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    UNIQUE(spin_id, sku_id)
+  );
+
+  -- Single-row config for the daily auto-add-usuals-to-cart schedule.
+  -- last_run_date + last_status let the scheduler fire at most once per day
+  -- and let the UI show a notice when a run was skipped (token expired /
+  -- backend was down past the grace window).
+  CREATE TABLE IF NOT EXISTS usuals_schedule (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled INTEGER NOT NULL DEFAULT 0,
+    time TEXT,
+    last_run_date TEXT,
+    last_status TEXT,
+    last_status_at TEXT,
+    updated_at TEXT NOT NULL
+  );
 `);
 
 // --- OAuth client registration (DCR result), single row ---
@@ -137,4 +171,120 @@ export function recordOrder({ domain, orderId, summary }) {
     `INSERT INTO order_history (domain, order_id, summary_json, created_at)
      VALUES (?, ?, ?, datetime('now'))`
   ).run(domain, orderId ?? null, JSON.stringify(summary ?? null));
+}
+
+// --- Usuals (local, user-editable Pantry Pal list) ---
+function rowToUsual(row) {
+  return {
+    spinId: row.spin_id,
+    skuId: row.sku_id,
+    displayName: row.name,
+    brand: row.brand,
+    quantityDescription: row.quantity_description,
+    mrp: row.mrp,
+    offerPrice: row.offer_price,
+    imageUrl: row.image_url,
+    quantity: row.quantity,
+  };
+}
+
+export function listUsuals() {
+  return db.prepare(`SELECT * FROM usuals ORDER BY created_at ASC, id ASC`).all().map(rowToUsual);
+}
+
+// Idempotent add: re-saving the same variant updates its details instead of
+// inserting a duplicate (UNIQUE(spin_id, sku_id) + upsert).
+export function addUsual(item) {
+  db.prepare(
+    `INSERT INTO usuals (spin_id, sku_id, name, brand, quantity_description, mrp, offer_price, image_url, quantity, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+     ON CONFLICT(spin_id, sku_id) DO UPDATE SET
+       name = excluded.name,
+       brand = excluded.brand,
+       quantity_description = excluded.quantity_description,
+       mrp = excluded.mrp,
+       offer_price = excluded.offer_price,
+       image_url = excluded.image_url`
+  ).run(
+    String(item.spinId),
+    item.skuId != null ? String(item.skuId) : null,
+    item.displayName ?? null,
+    item.brand ?? null,
+    item.quantityDescription ?? null,
+    item.mrp ?? null,
+    item.offerPrice ?? null,
+    item.imageUrl ?? null,
+    item.quantity ?? 1
+  );
+  return listUsuals();
+}
+
+export function removeUsual(spinId, skuId) {
+  if (skuId != null) {
+    db.prepare(`DELETE FROM usuals WHERE spin_id = ? AND sku_id = ?`).run(String(spinId), String(skuId));
+  } else {
+    db.prepare(`DELETE FROM usuals WHERE spin_id = ?`).run(String(spinId));
+  }
+  return listUsuals();
+}
+
+// --- Usuals daily auto-add schedule (single row) ---
+export function getUsualsSchedule() {
+  const row = db.prepare(`SELECT * FROM usuals_schedule WHERE id = 1`).get();
+  if (!row) {
+    return { enabled: false, time: null, lastRunDate: null, lastStatus: null, lastStatusAt: null };
+  }
+  return {
+    enabled: !!row.enabled,
+    time: row.time,
+    lastRunDate: row.last_run_date,
+    lastStatus: row.last_status,
+    lastStatusAt: row.last_status_at,
+  };
+}
+
+export function setUsualsSchedule({ enabled, time }) {
+  db.prepare(
+    `INSERT INTO usuals_schedule (id, enabled, time, updated_at)
+     VALUES (1, ?, ?, datetime('now'))
+     ON CONFLICT(id) DO UPDATE SET
+       enabled = excluded.enabled,
+       time = excluded.time,
+       updated_at = excluded.updated_at`
+  ).run(enabled ? 1 : 0, time ?? null);
+  return getUsualsSchedule();
+}
+
+// When a schedule is (re)saved, prime today's run-marker so the new time
+// takes effect from its NEXT occurrence rather than retroactively:
+//  - if the chosen time already passed today, stamp today as handled with a
+//    benign "scheduled" status (the scheduler skips a day already marked, and
+//    the UI treats an unknown status as no-notice) → starts tomorrow;
+//  - if the chosen time is still ahead today, clear the marker so it can fire
+//    later today.
+export function markScheduleScheduled(date) {
+  db.prepare(
+    `UPDATE usuals_schedule SET last_run_date = ?, last_status = 'scheduled', last_status_at = datetime('now') WHERE id = 1`
+  ).run(date);
+}
+
+export function clearScheduleMarker() {
+  db.prepare(
+    `UPDATE usuals_schedule SET last_run_date = NULL, last_status = NULL, last_status_at = NULL WHERE id = 1`
+  ).run();
+}
+
+// Records the outcome of a scheduled run (or a deliberately-flagged miss) so
+// the next tick won't re-fire today and the UI can surface a skip notice.
+export function recordScheduleRun({ date, status }) {
+  db.prepare(
+    `INSERT INTO usuals_schedule (id, enabled, time, last_run_date, last_status, last_status_at, updated_at)
+     VALUES (1, COALESCE((SELECT enabled FROM usuals_schedule WHERE id = 1), 0),
+                (SELECT time FROM usuals_schedule WHERE id = 1), ?, ?, datetime('now'), datetime('now'))
+     ON CONFLICT(id) DO UPDATE SET
+       last_run_date = excluded.last_run_date,
+       last_status = excluded.last_status,
+       last_status_at = excluded.last_status_at,
+       updated_at = excluded.updated_at`
+  ).run(date, status);
 }

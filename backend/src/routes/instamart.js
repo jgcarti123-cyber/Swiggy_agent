@@ -1,6 +1,12 @@
 import { Router } from "express";
 import { instamartClient } from "../mcp/instamartClient.js";
-import { getSavedAddress } from "../db.js";
+import {
+  getSavedAddress,
+  getUsualsSchedule,
+  setUsualsSchedule,
+  markScheduleScheduled,
+  clearScheduleMarker,
+} from "../db.js";
 import {
   sendMessage,
   resetConversation,
@@ -10,6 +16,9 @@ import {
   clearCartDirect,
   reorderUsualsDirect,
   setItemQuantity,
+  saveUsualDirect,
+  removeUsualDirect,
+  getUsuals,
 } from "../agent/instamartAgent.js";
 
 export const instamartRouter = Router();
@@ -115,4 +124,59 @@ instamartRouter.post("/set-quantity", async (req, res) => {
   if (!addressId) return;
   const result = await setItemQuantity({ addressId, spinId, skuId, quantity: Number(quantity) });
   res.json(result);
+});
+
+// --- Usuals (local, user-editable reorder list) + daily auto-add schedule.
+// These are local-state only — no Swiggy call, no delivery address needed —
+// except the schedule which the backend scheduler uses at trigger time. ---
+
+instamartRouter.get("/usuals", (req, res) => {
+  res.json({ usuals: getUsuals() });
+});
+
+instamartRouter.post("/usuals", (req, res) => {
+  const { spinId, skuId } = req.body || {};
+  if (!spinId) {
+    res.status(400).json({ error: "VALIDATION_ERROR", message: "spinId is required" });
+    return;
+  }
+  res.json(saveUsualDirect(req.body || {}));
+});
+
+instamartRouter.post("/usuals/remove", (req, res) => {
+  const { spinId, skuId } = req.body || {};
+  if (!spinId) {
+    res.status(400).json({ error: "VALIDATION_ERROR", message: "spinId is required" });
+    return;
+  }
+  res.json(removeUsualDirect({ spinId, skuId }));
+});
+
+instamartRouter.get("/usuals/schedule", (req, res) => {
+  res.json(getUsualsSchedule());
+});
+
+instamartRouter.put("/usuals/schedule", (req, res) => {
+  const { enabled, time } = req.body || {};
+  // "HH:MM" 24-hour, matching an <input type="time"> value. Reject anything
+  // else so a bad value can't leave the scheduler comparing against garbage.
+  if (enabled && !/^\d{2}:\d{2}$/.test(String(time || ""))) {
+    res.status(400).json({ error: "VALIDATION_ERROR", message: "time must be HH:MM when enabling" });
+    return;
+  }
+  const saved = setUsualsSchedule({ enabled: !!enabled, time: time || null });
+
+  // Prime today's run-marker so a newly-set time takes effect from its next
+  // occurrence, never retroactively (see db.js). Only relevant when enabled.
+  if (enabled) {
+    const now = new Date();
+    const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    const [h, m] = String(time).split(":").map(Number);
+    const alreadyPassed = now.getHours() * 60 + now.getMinutes() >= h * 60 + m;
+    if (alreadyPassed) markScheduleScheduled(today);
+    else clearScheduleMarker();
+    res.json(getUsualsSchedule());
+    return;
+  }
+  res.json(saved);
 });

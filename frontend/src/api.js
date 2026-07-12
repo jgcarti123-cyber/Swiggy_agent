@@ -58,6 +58,16 @@ export const api = {
   instamartReorderUsuals: () => request("/api/instamart/reorder-usuals", { method: "POST" }),
   instamartSetQuantity: (spinId, skuId, quantity) =>
     request("/api/instamart/set-quantity", { method: "POST", body: JSON.stringify({ spinId, skuId, quantity }) }),
+
+  // Usuals (local editable reorder list) + daily auto-add schedule.
+  instamartUsuals: () => request("/api/instamart/usuals"),
+  instamartSaveUsual: (product) =>
+    request("/api/instamart/usuals", { method: "POST", body: JSON.stringify(product) }),
+  instamartRemoveUsual: (spinId, skuId) =>
+    request("/api/instamart/usuals/remove", { method: "POST", body: JSON.stringify({ spinId, skuId }) }),
+  instamartUsualsSchedule: () => request("/api/instamart/usuals/schedule"),
+  instamartSetUsualsSchedule: (enabled, time) =>
+    request("/api/instamart/usuals/schedule", { method: "PUT", body: JSON.stringify({ enabled, time }) }),
 };
 
 export { ApiError };

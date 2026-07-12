@@ -1,9 +1,12 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api.js";
 import { AddressPicker } from "./AddressPicker.jsx";
 import { CartSummary } from "./CartSummary.jsx";
+import { UsualsPanel } from "./UsualsPanel.jsx";
 import { ProductThumb } from "./ProductThumb.jsx";
 import { ReauthNotice, isReauthError } from "./ReauthNotice.jsx";
+
+const usualKey = (item) => `${item.spinId}:${item.skuId}`;
 
 // Turn a /chat response into a renderable transcript message.
 function assistantMessageFromResult(result) {
@@ -20,11 +23,15 @@ export function InstamartChat() {
   const [hasAddress, setHasAddress] = useState(false);
   const [messages, setMessages] = useState([]);
   const [cart, setCart] = useState(null);
+  const [usuals, setUsuals] = useState([]);
+  const [schedule, setSchedule] = useState({ enabled: false, time: null });
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState(null);
   const [reauthError, setReauthError] = useState(null);
   const bottomRef = useRef(null);
+
+  const savedKeys = useMemo(() => new Set(usuals.map(usualKey)), [usuals]);
 
   useEffect(() => {
     api.instamartChatHistory().then((r) => setMessages(r.messages)).catch(() => {});
@@ -35,6 +42,8 @@ export function InstamartChat() {
         if (isReauthError(err)) setReauthError(err.message);
         else setCart({ error: err.message });
       });
+    api.instamartUsuals().then((r) => setUsuals(r.usuals || [])).catch(() => {});
+    api.instamartUsualsSchedule().then((s) => setSchedule(s)).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -55,6 +64,7 @@ export function InstamartChat() {
       const result = await apiCall();
       setMessages((prev) => [...prev, assistantMessageFromResult(result)]);
       if (result.cart) setCart(result.cart);
+      if (result.usuals) setUsuals(result.usuals);
     } catch (err) {
       if (isReauthError(err)) setReauthError(err.message);
       else setError(err.message);
@@ -88,11 +98,53 @@ export function InstamartChat() {
   }
 
   function reorderUsuals() {
-    runAction("Reorder my usual items", () => api.instamartReorderUsuals());
+    return runAction("Reorder my usual items", () => api.instamartReorderUsuals());
   }
 
   function clearCart() {
     runAction("Clear my cart", () => api.instamartClearCart());
+  }
+
+  // Star toggle on a product card — saves the item to / removes it from the
+  // local usuals list. No chat message; it's a list-config action.
+  async function toggleSaveUsual(product) {
+    const isSaved = savedKeys.has(usualKey(product));
+    setError(null);
+    try {
+      const res = isSaved
+        ? await api.instamartRemoveUsual(product.spinId, product.skuId)
+        : await api.instamartSaveUsual(product);
+      setUsuals(res.usuals || []);
+    } catch (err) {
+      if (isReauthError(err)) setReauthError(err.message);
+      else setError(err.message);
+    }
+  }
+
+  async function removeUsual(item) {
+    setError(null);
+    try {
+      const res = await api.instamartRemoveUsual(item.spinId, item.skuId);
+      setUsuals(res.usuals || []);
+    } catch (err) {
+      if (isReauthError(err)) setReauthError(err.message);
+      else setError(err.message);
+    }
+  }
+
+  async function changeSchedule(enabled, time) {
+    setError(null);
+    // Optimistic so the toggle/time feel instant; reconciled with the server's
+    // returned row (which also carries last-run status).
+    setSchedule((prev) => ({ ...prev, enabled, time }));
+    try {
+      const res = await api.instamartSetUsualsSchedule(enabled, enabled ? time : null);
+      setSchedule(res);
+    } catch (err) {
+      if (isReauthError(err)) setReauthError(err.message);
+      else setError(err.message);
+      api.instamartUsualsSchedule().then((s) => setSchedule(s)).catch(() => {});
+    }
   }
 
   async function reset() {
@@ -131,8 +183,10 @@ export function InstamartChat() {
                 key={i}
                 message={m}
                 disabled={sending || !hasAddress}
+                savedKeys={savedKeys}
                 onChoose={(opt) => sendMsg(opt)}
                 onAdd={addProduct}
+                onToggleSave={toggleSaveUsual}
                 onShowMore={showMore}
               />
             ))}
@@ -150,9 +204,6 @@ export function InstamartChat() {
           {error && <p className="error-text">{error}</p>}
 
           <div className="quick-actions">
-            <button type="button" className="quick-action" onClick={reorderUsuals} disabled={sending || !hasAddress}>
-              Reorder my usuals
-            </button>
             <button type="button" className="quick-action" onClick={clearCart} disabled={sending || !hasAddress}>
               Clear cart
             </button>
@@ -176,13 +227,21 @@ export function InstamartChat() {
 
         <div className="cart-column">
           <CartSummary cart={cart} onCartUpdate={setCart} />
+          <UsualsPanel
+            usuals={usuals}
+            schedule={schedule}
+            disabled={sending || !hasAddress}
+            onRemove={removeUsual}
+            onReorder={reorderUsuals}
+            onScheduleChange={changeSchedule}
+          />
         </div>
       </div>
     </section>
   );
 }
 
-function ChatMessage({ message, disabled, onChoose, onAdd, onShowMore }) {
+function ChatMessage({ message, disabled, savedKeys, onChoose, onAdd, onToggleSave, onShowMore }) {
   if (message.type === "choice") {
     return (
       <div className="chat-block chat-block-assistant">
@@ -210,7 +269,14 @@ function ChatMessage({ message, disabled, onChoose, onAdd, onShowMore }) {
         {message.intro && <div className="chat-message chat-message-assistant">{message.intro}</div>}
         <div className="product-grid">
           {message.products.map((p) => (
-            <ProductCard key={p.spinId} product={p} disabled={disabled} onAdd={() => onAdd(p)} />
+            <ProductCard
+              key={p.spinId}
+              product={p}
+              disabled={disabled}
+              saved={savedKeys?.has(`${p.spinId}:${p.skuId}`)}
+              onAdd={() => onAdd(p)}
+              onToggleSave={() => onToggleSave(p)}
+            />
           ))}
         </div>
         <button type="button" className="choice-chip show-more-chip" onClick={onShowMore} disabled={disabled}>
@@ -223,7 +289,7 @@ function ChatMessage({ message, disabled, onChoose, onAdd, onShowMore }) {
   return <div className={`chat-message chat-message-${message.role}`}>{message.text}</div>;
 }
 
-function ProductCard({ product: p, disabled, onAdd }) {
+function ProductCard({ product: p, disabled, saved, onAdd, onToggleSave }) {
   const hasDiscount = p.mrp != null && p.offerPrice != null && p.mrp > p.offerPrice;
   const outOfStock = p.inStock === false;
   return (
@@ -231,6 +297,17 @@ function ProductCard({ product: p, disabled, onAdd }) {
       <div className="product-card-imgwrap">
         <ProductThumb src={p.imageUrl} alt={p.displayName} className="product-card-img" />
         {outOfStock && <span className="oos-badge">Out of stock</span>}
+        <button
+          type="button"
+          className={`product-card-star${saved ? " product-card-star--saved" : ""}`}
+          onClick={onToggleSave}
+          disabled={disabled}
+          aria-pressed={!!saved}
+          aria-label={saved ? `Remove ${p.displayName} from usuals` : `Save ${p.displayName} to usuals`}
+          title={saved ? "Saved to usuals" : "Save to usuals"}
+        >
+          {saved ? "★" : "☆"}
+        </button>
       </div>
       <div className="product-card-body">
         <p className="product-card-name">{p.displayName}</p>

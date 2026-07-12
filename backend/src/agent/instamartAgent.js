@@ -1,6 +1,11 @@
 import { instamartClient } from "../mcp/instamartClient.js";
 import { runToolLoop } from "./toolLoop.js";
 import { NeedsReauthError } from "../auth/oauthClient.js";
+import {
+  listUsuals as dbListUsuals,
+  addUsual as dbAddUsual,
+  removeUsual as dbRemoveUsual,
+} from "../db.js";
 
 // Tool calls that mutate the cart — after any of these fire during a turn,
 // the live cart is re-fetched independently rather than trusting the
@@ -30,6 +35,7 @@ const SYSTEM_PROMPT = `You are Pantry Pal, a grocery assistant for Swiggy Instam
 - To find or add a product, call search_products with the best search term for what the user described (e.g. "milk", "chocolate cookies", "amul milk"). The app automatically shows the user a brand choice or product cards right after your search — you never need to ask which brand or list results yourself, just search.
 - For anything that isn't a fresh product search — removing an item, changing a quantity, clearing part of the cart, checking out — call get_cart first to see what's actually there, then update_cart with the full merged item list. You MUST actually call update_cart to make a change; never say you changed the cart without calling it.
 - Never call checkout unless the user has explicitly confirmed in this chat. For Cash on Delivery, confirm first then paymentMethod="Cash"; for UPI, call get_payment_options first.
+- The user has a personal "usuals" list (a saved reorder list). To LIST it, call get_usuals. To REMOVE something from it, call remove_from_usuals with the item name. To ADD something to it, just search_products for the item — every product card has a star (☆) the user taps to save it, so you don't add to usuals yourself; find the item and let them save it.
 - Keep replies short — cards and the live cart render separately, don't restate them.`;
 
 // Address parameters are intentionally omitted from these schemas: the server
@@ -100,6 +106,27 @@ const TOOLS = [
       name: "your_go_to_items",
       description: "Get the user's frequently/recently ordered items — use only when they ask about their order history, not for a normal reorder request.",
       parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_usuals",
+      description: "List the items on the user's saved 'usuals' list (their personal reorder list).",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "remove_from_usuals",
+      description:
+        "Remove one item from the user's saved 'usuals' list, matched by name. Pass the item's name or a distinctive word from it.",
+      parameters: {
+        type: "object",
+        properties: { name: { type: "string", description: "Name (or part of it) of the usual to remove" } },
+        required: ["name"],
+      },
     },
   },
   {
@@ -346,6 +373,30 @@ function filterRelevantProducts(raw, query) {
   // than reporting a false "nothing found" — same fallback principle already
   // used for forceBrand below when a brand name doesn't match anything exactly.
   return relevant.length > 0 ? { ...raw, products: relevant } : raw;
+}
+
+// Fuzzy-match a free-text name from the chat agent ("amul milk", "the bread")
+// against the local usuals list. Token-overlap, not contiguous substring — so
+// "amul milk" still matches "Amul Taaza Milky Milk" — picking the usual that
+// shares the most query words (across name + brand), ties broken by list
+// order. Reuses the same tokenizer as the search relevance filter above.
+function matchUsualByName(name, usuals) {
+  const tokens = significantTokens(name);
+  if (tokens.length === 0 || usuals.length === 0) return null;
+  let best = null;
+  let bestScore = 0;
+  for (const u of usuals) {
+    const hay = `${u.displayName || ""} ${u.brand || ""}`.toLowerCase();
+    let score = 0;
+    for (const t of tokens) {
+      if (tokenVariants(t).some((v) => hay.includes(v))) score++;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = u;
+    }
+  }
+  return bestScore > 0 ? best : null;
 }
 
 // Resolve variant refs back to full cards (with photo + price) from the
@@ -625,6 +676,21 @@ function makeExecuteTool(addressId) {
       }
       case "clear_cart":
         return instamartClient.clearCart();
+      case "get_usuals":
+        return {
+          usuals: dbListUsuals().map((u) => ({
+            spinId: u.spinId,
+            name: u.displayName,
+            brand: u.brand,
+            size: u.quantityDescription,
+          })),
+        };
+      case "remove_from_usuals": {
+        const match = matchUsualByName(args.name, dbListUsuals());
+        if (!match) return { removed: false, message: "No matching item on the usuals list." };
+        dbRemoveUsual(match.spinId, match.skuId);
+        return { removed: true, name: match.displayName };
+      }
       case "get_payment_options":
         return instamartClient.getPaymentOptions({ addressId });
       case "checkout": {
@@ -748,7 +814,11 @@ export async function sendMessage(userText, addressId, displayText = userText) {
     }
   }
 
-  return { ...responsePayload, cart: liveCart };
+  // If the model edited the usuals list this turn, hand the fresh list back so
+  // the My Usuals panel re-renders without a separate round-trip.
+  const usuals = executedTools.some((t) => t.name === "remove_from_usuals") ? dbListUsuals() : null;
+
+  return { ...responsePayload, cart: liveCart, usuals };
 }
 
 // ---------------------------------------------------------------------------
@@ -837,26 +907,78 @@ export async function clearCartDirect({ addressId, displayText = "Clear my cart"
   return { reply, cart };
 }
 
+// ---------------------------------------------------------------------------
+// Usuals list — LOCAL and user-editable (db.js `usuals` table), NOT Swiggy's
+// read-only your_go_to_items. Saving happens from a ☆ on any product card;
+// removing from the My Usuals panel or via the chat agent's remove_from_usuals
+// tool. "Reorder now" and the daily scheduler both add this local list into
+// the cart. (your_go_to_items still powers the "most ordered by you" search
+// badge — §6.9 — that's a separate, live signal.)
+// ---------------------------------------------------------------------------
+
+// Merge a set of items into the cart, tolerant of individual failures. Fast
+// path is one batch update_cart; only if that fails (typically because one
+// item went out of stock and Swiggy rejects the whole batch — §6.5) does it
+// fall back to adding items one at a time so the good ones still land. Used by
+// both "Reorder now" and the scheduler. Reauth errors propagate untouched.
+async function addUsualsBestEffort(addressId, items) {
+  try {
+    const cart = await mergeAndUpdateCart(addressId, items);
+    return { cart, added: items.length, failed: 0 };
+  } catch (err) {
+    if (err instanceof NeedsReauthError) throw err;
+    const current = await instamartClient.getCartOrEmpty();
+    const merged = new Map();
+    for (const i of current.items || []) {
+      merged.set(`${i.spinId}:${i.skuId}`, { spinId: i.spinId, skuId: i.skuId, quantity: i.quantity });
+    }
+    let added = 0;
+    let failed = 0;
+    for (const it of items) {
+      const key = `${it.spinId}:${it.skuId}`;
+      const trial = new Map(merged);
+      const existing = trial.get(key);
+      trial.set(key, { spinId: it.spinId, skuId: it.skuId, quantity: (existing?.quantity || 0) + (it.quantity || 1) });
+      try {
+        await instamartClient.updateCart({ selectedAddressId: addressId, items: [...trial.values()] });
+        merged.clear();
+        for (const [k, v] of trial) merged.set(k, v);
+        added++;
+      } catch (e) {
+        if (e instanceof NeedsReauthError) throw e;
+        failed++;
+      }
+    }
+    const cart = await instamartClient.getCartOrEmpty().catch(() => null);
+    return { cart, added, failed };
+  }
+}
+
+// Add the entire local usuals list into the cart (merge). Shared by the
+// "Reorder now" button, the chat "reorder my usuals", and the daily scheduler.
+export async function addUsualsToCart(addressId) {
+  const usuals = dbListUsuals();
+  if (usuals.length === 0) return { empty: true, added: 0, failed: 0, cart: null };
+  const items = usuals.map((u) => ({ spinId: u.spinId, skuId: u.skuId, quantity: u.quantity || 1 }));
+  const res = await addUsualsBestEffort(addressId, items);
+  return { empty: false, ...res };
+}
+
 export async function reorderUsualsDirect({ addressId, displayText = "Reorder my usual items" }) {
   displayTranscript.push({ role: "user", text: displayText });
   let reply;
   let cart = null;
   try {
-    const raw = await instamartClient.yourGoToItems({ addressId });
-    cacheProducts(raw);
-    // Only reorder in-stock items — including an out-of-stock one would make
-    // Swiggy reject the whole update_cart (see addItemDirect).
-    const variants = flattenVariants(raw)
-      .filter((v) => v.inStock !== false)
-      .slice(0, 8);
-    if (variants.length === 0) {
-      reply = "None of your usual items are in stock right now — try again later.";
+    const res = await addUsualsToCart(addressId);
+    cart = res.cart;
+    if (res.empty) {
+      reply = "Your usuals list is empty — find items in chat and tap the ☆ to save them here first.";
+    } else if (res.failed === 0) {
+      reply = `Added ${res.added} usual item${res.added === 1 ? "" : "s"} to your cart ✓`;
+    } else if (res.added === 0) {
+      reply = "Couldn't add your usuals — none seem to be available right now.";
     } else {
-      cart = await mergeAndUpdateCart(
-        addressId,
-        variants.map((v) => ({ ...v, quantity: 1 }))
-      );
-      reply = `Added ${variants.length} of your usual items to your cart ✓`;
+      reply = `Added ${res.added} of ${res.added + res.failed} usuals — the rest are unavailable right now.`;
     }
   } catch (err) {
     rethrowIfReauth(err);
@@ -866,6 +988,35 @@ export async function reorderUsualsDirect({ addressId, displayText = "Reorder my
   displayTranscript.push({ role: "assistant", text: reply });
   trimConversation();
   return { reply, cart };
+}
+
+// Deterministic usuals editing (UI-driven, no LLM, no chat transcript entry —
+// these are list-config actions like the cart stepper, not chat events). The
+// full card details come from the client (which already rendered them), with
+// the server-side product cache as a fallback for anything missing.
+export function saveUsualDirect(product = {}) {
+  const cached = productBySpin.get(String(product.spinId)) || productBySku.get(String(product.skuId));
+  const merged = { ...(cached || {}), ...product };
+  const usuals = dbAddUsual({
+    spinId: merged.spinId,
+    skuId: merged.skuId ?? null,
+    displayName: merged.displayName,
+    brand: merged.brand,
+    quantityDescription: merged.quantityDescription,
+    mrp: merged.mrp,
+    offerPrice: merged.offerPrice,
+    imageUrl: merged.imageUrl,
+  });
+  return { usuals };
+}
+
+export function removeUsualDirect({ spinId, skuId }) {
+  const usuals = dbRemoveUsual(String(spinId), skuId != null ? String(skuId) : null);
+  return { usuals };
+}
+
+export function getUsuals() {
+  return dbListUsuals();
 }
 
 // Cart quantity stepper (+/- on a cart line item). Unlike the other direct
