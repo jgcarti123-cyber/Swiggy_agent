@@ -35,7 +35,7 @@ const VARIANTS_PER_PAGE = 8;
 // completions is the lever that matters, more than shrinking any one of them.
 const SYSTEM_PROMPT = `You are Pantry Pal, a grocery assistant for Swiggy Instamart in a single-user dashboard. The delivery address is already set — never ask for it; it is added to every tool call automatically.
 
-- To find or add a product, call search_products with the best search term for what the user described (e.g. "milk", "chocolate cookies", "amul milk"). The app automatically shows the user a brand choice or product cards right after your search — you never need to ask which brand or list results yourself, just search.
+- To find or add a product, call search_products with the best search term for what the user described (e.g. "milk", "chocolate cookies", "amul milk"). If they state a pack size or weight (e.g. "100g paneer", "1kg rice", "2 pieces chicken"), keep it in the query exactly as they said it — the app uses it to filter results to that exact size. The app automatically shows the user a brand choice or product cards right after your search — you never need to ask which brand or list results yourself, just search.
 - For anything that isn't a fresh product search — removing an item, changing a quantity, clearing part of the cart, checking out — call get_cart first to see what's actually there, then update_cart with the full merged item list. You MUST actually call update_cart to make a change; never say you changed the cart without calling it.
 - Never call checkout unless the user has explicitly confirmed in this chat. For Cash on Delivery, confirm first then paymentMethod="Cash"; for UPI, call get_payment_options first.
 - The user has a personal "usuals" list (a saved reorder list). To LIST it, call get_usuals. To REMOVE something from it, call remove_from_usuals with the item name. To ADD something to it, just search_products for the item — every product card has a star (☆) the user taps to save it, so you don't add to usuals yourself; find the item and let them save it.
@@ -56,7 +56,10 @@ const TOOLS = [
       parameters: {
         type: "object",
         properties: {
-          query: { type: "string", description: "Product name, category, or brand" },
+          query: {
+            type: "string",
+            description: "Product name, category, or brand — include a stated pack size/weight verbatim (e.g. \"100g paneer\")",
+          },
         },
         required: ["query"],
       },
@@ -400,6 +403,82 @@ function filterRelevantProducts(raw, query) {
   return relevant.length > 0 ? { ...raw, products: relevant } : raw;
 }
 
+// ---------------------------------------------------------------------------
+// Requested-quantity filter — "add 100g of paneer" should only show 100 g
+// packs, not every pack size Swiggy returns for "paneer". Parsed straight
+// from the query text (no extra LLM call — SYSTEM_PROMPT tells the model to
+// keep a stated weight/quantity verbatim in the search query) and matched
+// against each variant's own quantityDescription ("100 g", "1 kg", "4
+// Pieces", "65 g x 2" — the last parsed as its per-pack size, ignoring the
+// "x 2" multiplier: "100g" most naturally means the pack the user sees, not
+// a multipack's total).
+// ---------------------------------------------------------------------------
+const QUANTITY_PATTERN =
+  /(\d+(?:\.\d+)?)\s*(kilograms?|kgs?|grams?|milliliters?|litres?|liters?|pieces?|pcs?|dozen|g|ml|l)\b/i;
+
+function canonicalUnit(raw) {
+  const u = raw.toLowerCase();
+  if (/^(kilograms?|kgs?)$/.test(u)) return "kg";
+  if (/^(grams?|g)$/.test(u)) return "g";
+  if (/^(milliliters?|ml)$/.test(u)) return "ml";
+  if (/^(litres?|liters?|l)$/.test(u)) return "l";
+  if (/^(pieces?|pcs?)$/.test(u)) return "piece";
+  if (u === "dozen") return "dozen";
+  return null;
+}
+
+function toBaseQuantity(amount, unit) {
+  switch (unit) {
+    case "g": return { family: "weight", value: amount };
+    case "kg": return { family: "weight", value: amount * 1000 };
+    case "ml": return { family: "volume", value: amount };
+    case "l": return { family: "volume", value: amount * 1000 };
+    case "piece": return { family: "count", value: amount };
+    case "dozen": return { family: "count", value: amount * 12 };
+    default: return null;
+  }
+}
+
+// Used both on the user's query ("100g paneer") and on a variant's own
+// quantityDescription ("100 g") — same parser, so the two are guaranteed to
+// compare on the same terms.
+function parseQuantityFrom(text) {
+  const m = String(text || "").match(QUANTITY_PATTERN);
+  if (!m) return null;
+  const unit = canonicalUnit(m[2]);
+  if (!unit) return null;
+  return toBaseQuantity(parseFloat(m[1]), unit);
+}
+
+function quantityMatches(requested, variantDesc) {
+  const actual = parseQuantityFrom(variantDesc);
+  if (!actual) return false; // can't confirm a match — exclude rather than guess
+  return actual.family === requested.family && Math.abs(actual.value - requested.value) < 0.001;
+}
+
+function formatQty(q) {
+  if (q.family === "weight") return q.value >= 1000 ? `${q.value / 1000} kg` : `${q.value} g`;
+  if (q.family === "volume") return q.value >= 1000 ? `${q.value / 1000} l` : `${q.value} ml`;
+  return `${q.value} pc${q.value === 1 ? "" : "s"}`;
+}
+
+// Narrows the raw product list to variants whose own pack size matches what
+// was requested. If nothing at that size exists, falls back to the
+// unfiltered set (same don't-report-a-false-empty principle as
+// filterRelevantProducts above and forceBrand below) — sizeMatchedAny tells
+// the caller whether to prepend a "couldn't find that exact size" notice.
+function filterByRequestedQuantity(raw, requested) {
+  if (!requested) return { raw, sizeMatchedAny: true };
+  const products = Array.isArray(raw?.products) ? raw.products : [];
+  const filtered = [];
+  for (const p of products) {
+    const keep = (p.variations || []).filter((v) => quantityMatches(requested, v.quantityDescription));
+    if (keep.length > 0) filtered.push({ ...p, variations: keep });
+  }
+  if (filtered.length === 0) return { raw, sizeMatchedAny: false };
+  return { raw: { ...raw, products: filtered }, sizeMatchedAny: true };
+}
+
 // Fuzzy-match a free-text name from the chat agent ("amul milk", "the bread")
 // against the local usuals list. Token-overlap, not contiguous substring — so
 // "amul milk" still matches "Amul Taaza Milky Milk" — picking the usual that
@@ -482,6 +561,35 @@ function sortVariants(variants) {
   });
 }
 
+function plainTokens(text) {
+  return String(text || "").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+}
+
+// The user's own free-text query can already name one of the brands Swiggy's
+// fuzzy search fanned out into (e.g. "order SuperYou 10g Protein Wafer Bar"
+// returning Yogabar/Ritebite/PHAB alongside SuperYou) — asking "which brand?"
+// when they just said it is exactly the annoyance this exists to prevent.
+// Word-boundary contiguous match (not a raw substring), so a short brand
+// name can't accidentally match part of an unrelated word. Only trusted when
+// exactly one candidate brand is named — if the query somehow names two,
+// that's genuinely ambiguous and falls through to asking as normal, so this
+// can never make a real multi-brand question disappear.
+function detectExplicitBrand(query, brands) {
+  const queryTokens = plainTokens(query);
+  const matches = [];
+  for (const brand of brands) {
+    const brandTokens = plainTokens(brand);
+    if (brandTokens.length === 0) continue;
+    for (let i = 0; i + brandTokens.length <= queryTokens.length; i++) {
+      if (brandTokens.every((t, j) => queryTokens[i + j] === t)) {
+        matches.push(brand);
+        break;
+      }
+    }
+  }
+  return matches.length === 1 ? matches[0] : null;
+}
+
 // `forceBrand`, when set, means the user already answered "which brand" —
 // there is nothing left to ask, no matter how many other brands Swiggy's
 // fuzzy search mixes into these particular results. Filter down to the
@@ -493,12 +601,26 @@ async function runSearchAndBranch(query, addressId, { forceBrand, skipBrandAsk }
     instamartClient.searchProducts({ query, addressId }),
     getGoToIndex(addressId),
   ]);
-  const raw = filterRelevantProducts(rawSearch, query);
+  const relevant = filterRelevantProducts(rawSearch, query);
+
+  // If the user named a pack size ("100g paneer"), narrow to matching
+  // variants BEFORE anything else (brand grouping, sorting) sees the
+  // results — so a brand that only sells a different size is never offered
+  // as a choice for this request, and "show more" only pages through
+  // genuinely matching sizes.
+  const requestedQty = parseQuantityFrom(query);
+  const { raw, sizeMatchedAny } = filterByRequestedQuantity(relevant, requestedQty);
   cacheProducts(raw);
   let variants = flattenVariants(raw, goToIndex);
 
-  if (forceBrand) {
-    const target = forceBrand.toLowerCase();
+  // Compute the brand list (post size-filter) whenever an ask would
+  // otherwise be possible, so it can double as input to the explicit-brand
+  // auto-detect below — same list either way, no extra work.
+  const brands = !forceBrand && !skipBrandAsk ? distinctBrands(raw) : [];
+  const effectiveForceBrand = forceBrand || (brands.length >= 2 ? detectExplicitBrand(query, brands) : null);
+
+  if (effectiveForceBrand) {
+    const target = effectiveForceBrand.toLowerCase();
     const filtered = variants.filter((v) => (v.brand || "").toLowerCase() === target);
     // If nothing matched exactly (brand-name casing/variant mismatch), fall
     // back to the unfiltered set rather than reporting a false "not found".
@@ -512,23 +634,26 @@ async function runSearchAndBranch(query, addressId, { forceBrand, skipBrandAsk }
     return { kind: "empty", payload: { query } };
   }
 
-  if (!forceBrand && !skipBrandAsk) {
-    const brands = distinctBrands(raw);
-    if (brands.length >= 2) {
-      // brandsOffered stays the CLEAN brand-name list — matchOfferedBrand and
-      // forceBrand filtering above key off these exact strings. Only the
-      // *displayed* option labels get the "(most ordered by you)" suffix; a
-      // click still sends that full label back, and matchOfferedBrand's
-      // substring check (below) still resolves it to the clean name.
-      const ranks = brandGoToRanks(raw, goToIndex);
-      const ranked = [...brands].sort((a, b) => (ranks.get(a) ?? Infinity) - (ranks.get(b) ?? Infinity));
-      pendingBrandChoice = { originalQuery: query, brandsOffered: ranked };
-      const options = ranked.map((b) => (ranks.has(b) ? `${b} (most ordered by you)` : b));
-      return {
-        kind: "choice",
-        payload: { question: `Which brand of ${query} would you like?`, options: [...options, ANY_BRAND_LABEL] },
-      };
-    }
+  const sizeNotice =
+    requestedQty && !sizeMatchedAny ? `Couldn't find a ${formatQty(requestedQty)} pack — here's what's available:` : null;
+
+  if (!effectiveForceBrand && !skipBrandAsk && brands.length >= 2) {
+    // brandsOffered stays the CLEAN brand-name list — matchOfferedBrand and
+    // forceBrand filtering above key off these exact strings. Only the
+    // *displayed* option labels get the "(most ordered by you)" suffix; a
+    // click still sends that full label back, and matchOfferedBrand's
+    // substring check (below) still resolves it to the clean name.
+    const ranks = brandGoToRanks(raw, goToIndex);
+    const ranked = [...brands].sort((a, b) => (ranks.get(a) ?? Infinity) - (ranks.get(b) ?? Infinity));
+    pendingBrandChoice = { originalQuery: query, brandsOffered: ranked };
+    const options = ranked.map((b) => (ranks.has(b) ? `${b} (most ordered by you)` : b));
+    return {
+      kind: "choice",
+      payload: {
+        question: sizeNotice ? `${sizeNotice} Which brand would you like?` : `Which brand of ${query} would you like?`,
+        options: [...options, ANY_BRAND_LABEL],
+      },
+    };
   }
 
   pendingBrandChoice = null;
@@ -536,7 +661,7 @@ async function runSearchAndBranch(query, addressId, { forceBrand, skipBrandAsk }
   lastSearchContext = { query, allVariants: variants, shown: shown.length };
   return {
     kind: "products",
-    payload: { intro: `Here's what I found for "${query}":`, items: enrichProducts(shown) },
+    payload: { intro: sizeNotice || `Here's what I found for "${query}":`, items: enrichProducts(shown) },
   };
 }
 
