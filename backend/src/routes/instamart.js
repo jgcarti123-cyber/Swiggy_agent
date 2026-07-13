@@ -19,6 +19,8 @@ import {
   saveUsualDirect,
   removeUsualDirect,
   getUsuals,
+  confirmRecipeDirect,
+  swapRecipeItemDirect,
 } from "../agent/instamartAgent.js";
 
 export const instamartRouter = Router();
@@ -123,6 +125,38 @@ instamartRouter.post("/set-quantity", async (req, res) => {
   const addressId = requireSavedAddress(res);
   if (!addressId) return;
   const result = await setItemQuantity({ addressId, spinId, skuId, quantity: Number(quantity) });
+  res.json(result);
+});
+
+// Recipe flow step 2: the user confirmed (possibly edited) the ingredient
+// checklist the model proposed. Fully deterministic from here — parallel
+// searches + best-per-ingredient auto-add, zero LLM calls.
+instamartRouter.post("/recipe-confirm", async (req, res) => {
+  const { dish, ingredients } = req.body || {};
+  if (!Array.isArray(ingredients)) {
+    res.status(400).json({ error: "VALIDATION_ERROR", message: "ingredients array is required" });
+    return;
+  }
+  const addressId = requireSavedAddress(res);
+  if (!addressId) return;
+  const result = await confirmRecipeDirect({
+    dish: String(dish || "your dish"),
+    ingredients,
+    addressId,
+  });
+  res.json(result);
+});
+
+// Swap which option is in the cart for one recipe ingredient.
+instamartRouter.post("/recipe-swap", async (req, res) => {
+  const { ingredient, removeSpinId, removeSkuId, spinId, skuId } = req.body || {};
+  if (!spinId || !skuId) {
+    res.status(400).json({ error: "VALIDATION_ERROR", message: "spinId and skuId are required" });
+    return;
+  }
+  const addressId = requireSavedAddress(res);
+  if (!addressId) return;
+  const result = await swapRecipeItemDirect({ addressId, ingredient, removeSpinId, removeSkuId, spinId, skuId });
   res.json(result);
 });
 

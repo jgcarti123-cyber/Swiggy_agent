@@ -32,6 +32,7 @@ function money(v) {
 
 export function UsualsPanel({ usuals, schedule, disabled, onRemove, onReorder, onScheduleChange }) {
   const [reordering, setReordering] = useState(false);
+  const [open, setOpen] = useState(true); // collapsible, open by default
   const enabled = !!schedule?.enabled;
   const time = schedule?.time || "08:00";
   const status = scheduleStatus(schedule || {});
@@ -48,11 +49,30 @@ export function UsualsPanel({ usuals, schedule, disabled, onRemove, onReorder, o
 
   return (
     <div className="usuals-panel">
-      <div className="usuals-header">
+      <button
+        type="button"
+        className="usuals-header usuals-header--toggle"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+      >
         <h3>My Usuals</h3>
         {usuals.length > 0 && <span className="usuals-count">{usuals.length}</span>}
-      </div>
+        <span className={`usuals-chevron${open ? " usuals-chevron--open" : ""}`} aria-hidden="true">
+          ▾
+        </span>
+      </button>
 
+      {open && (
+        <div className="usuals-body">
+          {renderBody()}
+        </div>
+      )}
+    </div>
+  );
+
+  function renderBody() {
+    return (
+      <>
       {usuals.length === 0 ? (
         <p className="usuals-empty">
           No usuals yet. Find items in chat and tap the <span className="usuals-star-hint">☆</span> on a card to save
@@ -116,6 +136,7 @@ export function UsualsPanel({ usuals, schedule, disabled, onRemove, onReorder, o
         </p>
         {status && <p className={`usuals-status usuals-status--${status.level}`}>{status.text}</p>}
       </div>
-    </div>
-  );
+      </>
+    );
+  }
 }

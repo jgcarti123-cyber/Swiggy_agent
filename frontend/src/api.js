@@ -59,6 +59,12 @@ export const api = {
   instamartSetQuantity: (spinId, skuId, quantity) =>
     request("/api/instamart/set-quantity", { method: "POST", body: JSON.stringify({ spinId, skuId, quantity }) }),
 
+  // Recipe flow: confirm the (edited) ingredient checklist, swap one pick.
+  instamartRecipeConfirm: (dish, ingredients) =>
+    request("/api/instamart/recipe-confirm", { method: "POST", body: JSON.stringify({ dish, ingredients }) }),
+  instamartRecipeSwap: (payload) =>
+    request("/api/instamart/recipe-swap", { method: "POST", body: JSON.stringify(payload) }),
+
   // Usuals (local editable reorder list) + daily auto-add schedule.
   instamartUsuals: () => request("/api/instamart/usuals"),
   instamartSaveUsual: (product) =>

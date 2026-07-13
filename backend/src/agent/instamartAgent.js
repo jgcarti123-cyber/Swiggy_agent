@@ -1,6 +1,7 @@
 import { instamartClient } from "../mcp/instamartClient.js";
 import { runToolLoop } from "./toolLoop.js";
 import { NeedsReauthError } from "../auth/oauthClient.js";
+import { mapWithConcurrency } from "../utils/concurrency.js";
 import {
   listUsuals as dbListUsuals,
   addUsual as dbAddUsual,
@@ -36,6 +37,7 @@ const SYSTEM_PROMPT = `You are Pantry Pal, a grocery assistant for Swiggy Instam
 - For anything that isn't a fresh product search — removing an item, changing a quantity, clearing part of the cart, checking out — call get_cart first to see what's actually there, then update_cart with the full merged item list. You MUST actually call update_cart to make a change; never say you changed the cart without calling it.
 - Never call checkout unless the user has explicitly confirmed in this chat. For Cash on Delivery, confirm first then paymentMethod="Cash"; for UPI, call get_payment_options first.
 - The user has a personal "usuals" list (a saved reorder list). To LIST it, call get_usuals. To REMOVE something from it, call remove_from_usuals with the item name. To ADD something to it, just search_products for the item — every product card has a star (☆) the user taps to save it, so you don't add to usuals yourself; find the item and let them save it.
+- If the user asks for everything needed to MAKE or COOK a dish/meal ("order things for biryani", "I want to make pasta"), call propose_ingredients with the dish name and its essential ingredient list. Each ingredient must be a short, generic Instamart search term (e.g. "basmati rice", "curd", "mint leaves") — no brands, no quantities, no steps. Keep it minimal: only what the dish genuinely needs. The app shows the user the list to edit and confirm — do not search for the items yourself.
 - Keep replies short — cards and the live cart render separately, don't restate them.`;
 
 // Address parameters are intentionally omitted from these schemas: the server
@@ -106,6 +108,27 @@ const TOOLS = [
       name: "your_go_to_items",
       description: "Get the user's frequently/recently ordered items — use only when they ask about their order history, not for a normal reorder request.",
       parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "propose_ingredients",
+      description:
+        "When the user wants to order everything needed to make/cook a dish or meal, propose its essential ingredient list. The app shows the list to the user for editing and confirmation — you generate the list, nothing else.",
+      parameters: {
+        type: "object",
+        properties: {
+          dish: { type: "string", description: "The dish/meal name, e.g. \"biryani\"" },
+          ingredients: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              "Essential ingredients as short generic grocery search terms (no brands/quantities), e.g. [\"basmati rice\", \"chicken\", \"curd\", \"fried onions\", \"mint leaves\", \"biryani masala\", \"ghee\"]",
+          },
+        },
+        required: ["dish", "ingredients"],
+      },
     },
   },
   {
@@ -692,6 +715,29 @@ function makeExecuteTool(addressId) {
       }
       case "clear_cart":
         return instamartClient.clearCart();
+      case "propose_ingredients": {
+        // The model's ONLY job here was generating the list — showing it for
+        // edit/confirm is a fixed outcome, so end the loop now (§6.4 pattern:
+        // no second completion to restate a decision already made). The
+        // Confirm click comes back through /recipe-confirm, a fully
+        // deterministic endpoint — the whole recipe flow costs exactly one
+        // Groq completion.
+        const dish = String(args.dish || "").trim() || "your dish";
+        const seen = new Set();
+        const ingredients = [];
+        for (const raw of Array.isArray(args.ingredients) ? args.ingredients : []) {
+          const ing = String(raw || "").trim();
+          const key = ing.toLowerCase();
+          if (!ing || seen.has(key)) continue;
+          seen.add(key);
+          ingredients.push(ing);
+          if (ingredients.length >= 16) break; // "minimal" is the product requirement
+        }
+        if (ingredients.length === 0) {
+          return { error: "ingredients array was empty — nothing to propose" };
+        }
+        return { __endLoop: true, kind: "ingredients", payload: { dish, ingredients } };
+      }
       case "get_usuals":
         return {
           usuals: dbListUsuals().map((u) => ({
@@ -766,6 +812,13 @@ function buildFromBranch(kind, payload, text) {
     }
     const fallback = "I couldn't pull those options up — mind trying again?";
     return { entry: { role: "assistant", text: fallback }, responsePayload: { reply: fallback } };
+  }
+  if (kind === "ingredients") {
+    const { dish, ingredients } = payload;
+    return {
+      entry: { role: "assistant", type: "ingredients", dish, ingredients },
+      responsePayload: { reply: "", ingredients: { dish, ingredients } },
+    };
   }
   if (kind === "empty") {
     const reply = `Couldn't find anything for "${payload.query}" — want to try a different search?`;
@@ -1035,6 +1088,140 @@ export async function reorderUsualsDirect({ addressId, displayText = "Reorder my
   return { reply, cart };
 }
 
+// ---------------------------------------------------------------------------
+// Recipe flow, step 2 of 2 — fully deterministic, zero Groq calls. Step 1 was
+// the model calling propose_ingredients (one completion, ends the loop); the
+// user then edits the checklist in the UI and hits Confirm, which lands here
+// with the FINAL ingredient list. Each ingredient is searched in parallel
+// (capped at 3 concurrent — same rate-limit reasoning as Feast Finder's
+// scoped-menu fan-out), reusing the exact same pipeline as a normal guided
+// search: relevance filter (§6.10), go-to cross-reference (§6.9), stock/price
+// sort (§6.5). The best in-stock option per ingredient goes straight into the
+// cart via addUsualsBestEffort (which verifies the real cart, §6.5's silent-
+// drop lesson), and up to 3 compact options per ingredient go back for the
+// swap UI.
+// ---------------------------------------------------------------------------
+const OPTIONS_PER_INGREDIENT = 3;
+
+// Held so swapRecipeItemDirect can update which option is marked "added" on
+// the rendered transcript entry (same object, by reference) — a swap is a
+// cart mutation like the stepper, not a new chat message.
+let lastRecipeEntry = null;
+
+export async function confirmRecipeDirect({ dish, ingredients, addressId }) {
+  const list = [...new Set((ingredients || []).map((i) => String(i || "").trim()).filter(Boolean))].slice(0, 16);
+  displayTranscript.push({ role: "user", text: `Confirm ingredients for ${dish} (${list.length})` });
+
+  // Mark the checklist entry consumed so a page reload renders it inert
+  // instead of offering a second Confirm that would double-add everything.
+  for (let i = displayTranscript.length - 1; i >= 0; i--) {
+    if (displayTranscript[i].type === "ingredients" && !displayTranscript[i].confirmed) {
+      displayTranscript[i].confirmed = true;
+      break;
+    }
+  }
+
+  if (list.length === 0) {
+    const reply = "The ingredient list is empty — nothing to order.";
+    displayTranscript.push({ role: "assistant", text: reply });
+    trimConversation();
+    return { reply, cart: null };
+  }
+
+  try {
+    const goToIndex = await getGoToIndex(addressId);
+    const groups = await mapWithConcurrency(list, 3, async (ingredient) => {
+      try {
+        const rawSearch = await instamartClient.searchProducts({ query: ingredient, addressId });
+        const raw = filterRelevantProducts(rawSearch, ingredient);
+        cacheProducts(raw);
+        const inStock = sortVariants(flattenVariants(raw, goToIndex)).filter((v) => v.inStock !== false);
+        return { ingredient, options: enrichProducts(inStock.slice(0, OPTIONS_PER_INGREDIENT)) };
+      } catch (err) {
+        rethrowIfReauth(err);
+        // One ingredient's search failing shouldn't sink the whole recipe.
+        return { ingredient, options: [] };
+      }
+    });
+
+    const found = groups.filter((g) => g.options.length > 0);
+    const missing = groups.filter((g) => g.options.length === 0).map((g) => g.ingredient);
+
+    let cart = null;
+    let added = 0;
+    if (found.length > 0) {
+      const bestItems = found.map((g) => ({ spinId: g.options[0].spinId, skuId: g.options[0].skuId, quantity: 1 }));
+      const res = await addUsualsBestEffort(addressId, bestItems);
+      cart = res.cart;
+      added = res.added;
+      // Mark which option actually landed per group from the REAL cart —
+      // never from call success (§6.5's silent-drop lesson applies here too).
+      const present = keysInCart(cart);
+      for (const g of found) {
+        const best = g.options[0];
+        g.addedSpinId = present.has(itemKey(best.spinId, best.skuId)) ? best.spinId : null;
+      }
+    }
+
+    let reply;
+    if (found.length === 0) {
+      reply = `Couldn't find anything for those ingredients right now — try different search terms.`;
+    } else {
+      reply = `Added ${added} of ${found.length} ingredients for ${dish} — tap Swap below to change any pick.`;
+      if (missing.length > 0) reply += ` Couldn't find: ${missing.join(", ")}.`;
+    }
+
+    const entry = { role: "assistant", type: "recipe", dish, reply, groups };
+    lastRecipeEntry = entry;
+    displayTranscript.push(entry);
+    trimConversation();
+    return { reply, recipe: { dish, groups }, cart };
+  } catch (err) {
+    rethrowIfReauth(err);
+    const reply = `Couldn't put the ${dish} list together — ${friendlyCartError(err)}`;
+    displayTranscript.push({ role: "assistant", text: reply });
+    trimConversation();
+    return { reply, cart: null };
+  }
+}
+
+// Swap the cart line for one ingredient: drop the previously-added option,
+// add the tapped one (verified against the returned cart, one retry — same
+// policy as addItemDirect). Not a chat event: no transcript entry, but the
+// last recipe entry's "added" marker is updated in place so a reload renders
+// the current truth.
+export async function swapRecipeItemDirect({ addressId, ingredient, removeSpinId, removeSkuId, spinId, skuId }) {
+  try {
+    const current = await instamartClient.getCartOrEmpty();
+    const items = (current.items || [])
+      .filter((i) => !(String(i.spinId) === String(removeSpinId) && String(i.skuId) === String(removeSkuId)))
+      .map((i) => ({ spinId: i.spinId, skuId: i.skuId, quantity: i.quantity }));
+    const already = items.find((i) => String(i.spinId) === String(spinId) && String(i.skuId) === String(skuId));
+    if (already) already.quantity += 1;
+    else items.push({ spinId, skuId, quantity: 1 });
+    await instamartClient.updateCart({ selectedAddressId: addressId, items });
+
+    let cart = await instamartClient.getCartOrEmpty();
+    if (!keysInCart(cart).has(itemKey(spinId, skuId))) {
+      await instamartClient.updateCart({ selectedAddressId: addressId, items });
+      cart = await instamartClient.getCartOrEmpty();
+    }
+    const landed = keysInCart(cart).has(itemKey(spinId, skuId));
+
+    if (landed && lastRecipeEntry) {
+      const group = lastRecipeEntry.groups.find((g) => g.ingredient === ingredient);
+      if (group) group.addedSpinId = String(spinId);
+    }
+    return landed
+      ? { cart, addedSpinId: String(spinId) }
+      : { cart, error: "Swiggy isn't letting that option be added right now — try another." };
+  } catch (err) {
+    rethrowIfReauth(err);
+    const cart = await instamartClient.getCartOrEmpty().catch(() => null);
+    return { cart, error: friendlyCartError(err) };
+  }
+}
+
 // Deterministic usuals editing (UI-driven, no LLM, no chat transcript entry —
 // these are list-config actions like the cart stepper, not chat events). The
 // full card details come from the client (which already rendered them), with
@@ -1098,6 +1285,7 @@ export function resetConversation() {
   displayTranscript = [];
   pendingBrandChoice = null;
   lastSearchContext = null;
+  lastRecipeEntry = null;
 }
 
 export function getConversationForDisplay() {
