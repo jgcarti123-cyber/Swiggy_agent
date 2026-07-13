@@ -14,8 +14,10 @@ import {
 const CART_TOUCHING_TOOLS = new Set(["update_cart", "checkout", "clear_cart"]);
 
 // How many variant cards to show per screen (initial results + each "show
-// more" page).
-const VARIANTS_PER_PAGE = 6;
+// more" page). The card grid is auto-fill (frontend/src/index.css), so on
+// the chat column's usual width this renders as two full rows of 4 rather
+// than 6 with an empty gap.
+const VARIANTS_PER_PAGE = 8;
 
 // The delivery addressId is resolved server-side (from the saved address the
 // user picked in the UI) and injected into every tool call — the model never
