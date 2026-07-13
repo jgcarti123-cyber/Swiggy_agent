@@ -1929,3 +1929,143 @@ button:disabled {
   background: var(--orange);
   color: #fff;
 }
+
+/* ---------------------------------------------------------------------------
+   Import-from-screenshot: the 📷 attach button, the editable review checklist,
+   and the exact-match / pick-one note on the reused recipe result rows.
+   --------------------------------------------------------------------------- */
+
+.chat-attach-btn {
+  flex-shrink: 0;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 0 14px;
+  font-size: 1.2rem;
+  line-height: 1;
+}
+
+.chat-attach-btn:hover:not(:disabled) {
+  background: var(--orange-tint);
+  border-color: var(--orange);
+}
+
+.import-list {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 560px;
+}
+
+.import-list--done {
+  opacity: 0.75;
+}
+
+.import-rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.import-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 4px;
+  border-bottom: 1px solid var(--border);
+}
+
+.import-row:last-child {
+  border-bottom: none;
+}
+
+.import-row-info {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1;
+}
+
+.import-row-name {
+  font-size: 0.86rem;
+  font-weight: 600;
+  color: var(--text-dark);
+}
+
+.import-row-size {
+  font-size: 0.76rem;
+  color: var(--text-muted);
+}
+
+.import-qty-stepper {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.import-qty-stepper button {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 8px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-strong);
+  color: var(--text-dark);
+  font-size: 1rem;
+  line-height: 1;
+  display: grid;
+  place-items: center;
+}
+
+.import-qty-stepper button:hover:not(:disabled) {
+  background: var(--orange-tint);
+  border-color: var(--orange);
+}
+
+.import-qty-stepper > span {
+  min-width: 16px;
+  text-align: center;
+  font-weight: 700;
+  font-size: 0.86rem;
+}
+
+.import-row-qty-static {
+  font-weight: 700;
+  font-size: 0.86rem;
+  color: var(--text-muted);
+}
+
+.import-row-remove {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 1.2rem;
+  line-height: 1;
+  padding: 0 4px;
+}
+
+.import-row-remove:hover:not(:disabled) {
+  color: var(--nonveg);
+}
+
+/* exact-match / pick-one label on the reused recipe result rows */
+.recipe-group-note {
+  font-size: 0.74rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.recipe-group-note--ok {
+  color: var(--green-dark);
+}

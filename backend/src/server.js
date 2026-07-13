@@ -10,7 +10,10 @@ import { startUsualsScheduler } from "./scheduler.js";
 
 const app = express();
 app.use(cors({ origin: config.frontendOrigin, credentials: true }));
-app.use(express.json());
+// 8mb (vs the 100kb default) so an uploaded screenshot data URL fits — the
+// frontend downscales/JPEG-compresses to well under 1mb before sending, this
+// is just safe headroom. Local single-user app, so the larger limit is fine.
+app.use(express.json({ limit: "8mb" }));
 
 app.use("/auth", authRouter);
 app.use("/api/food", foodRouter);

@@ -22,7 +22,37 @@ function assistantMessageFromResult(result) {
   if (result.recipe) {
     return { role: "assistant", type: "recipe", dish: result.recipe.dish, reply: result.reply, groups: result.recipe.groups || [] };
   }
+  if (result.import) {
+    return { role: "assistant", type: "import", items: result.import.items || [] };
+  }
   return { role: "assistant", text: result.reply || "(no reply)" };
+}
+
+// Downscale + JPEG-compress an uploaded image in the browser before sending —
+// a phone screenshot PNG can be several MB, and Groq's vision endpoint caps a
+// base64 image at 4MB. Cap the long edge at 1600px (plenty for reading text)
+// and encode JPEG at 0.82; a full cart screenshot lands well under 1MB.
+function downscaleImage(file, maxEdge = 1600, quality = 0.82) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Couldn't read that file"));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error("That doesn't look like an image"));
+      img.onload = () => {
+        const scale = Math.min(1, maxEdge / Math.max(img.width, img.height));
+        const w = Math.round(img.width * scale);
+        const h = Math.round(img.height * scale);
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL("image/jpeg", quality));
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
 }
 
 // Rotating status shown with the typing dots while Pantry Pal works. Advances
@@ -42,6 +72,7 @@ export function InstamartChat() {
   const [error, setError] = useState(null);
   const [reauthError, setReauthError] = useState(null);
   const bottomRef = useRef(null);
+  const fileInputRef = useRef(null);
 
   useEffect(() => {
     if (!sending) {
@@ -126,6 +157,31 @@ export function InstamartChat() {
     runAction("Clear my cart", () => api.instamartClearCart());
   }
 
+  // Screenshot upload: downscale locally, then send for extraction. Reuses
+  // runAction so it shares the thinking indicator + error/reauth handling.
+  async function onImageChosen(e) {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // allow re-picking the same file later
+    if (!file || sending || !hasAddress) return;
+    let dataUrl;
+    try {
+      dataUrl = await downscaleImage(file);
+    } catch (err) {
+      setError(err.message);
+      return;
+    }
+    runAction("📷 Imported a screenshot", () => api.instamartImportImage(dataUrl));
+  }
+
+  // Import checklist confirmed (possibly edited): mark it consumed locally,
+  // then run the deterministic size-strict search-and-add.
+  function confirmImport(message, items) {
+    setMessages((prev) => prev.map((m) => (m === message ? { ...m, confirmed: true } : m)));
+    runAction(`Import ${items.length} item${items.length === 1 ? "" : "s"} from the screenshot`, () =>
+      api.instamartImportConfirm(items)
+    );
+  }
+
   // Recipe checklist confirmed (possibly after edits): mark the checklist
   // message consumed locally (the server does the same to its transcript
   // copy), then run the deterministic search-and-add step.
@@ -149,6 +205,7 @@ export function InstamartChat() {
         removeSkuId: prevAdded?.skuId,
         spinId: option.spinId,
         skuId: option.skuId,
+        quantity: group.quantity, // undefined for recipes (server defaults to 1)
       });
       if (res.error) setError(res.error);
       if (res.cart) setCart(res.cart);
@@ -240,7 +297,8 @@ export function InstamartChat() {
                 <p className="chat-empty-title">👋 Hi, I'm Pantry Pal</p>
                 <p className="muted">
                   Try <em>"add milk"</em> and I'll ask which brand, say exactly what you want like{" "}
-                  <em>"add Amul Taaza 500ml"</em>, or go big: <em>"order things for making biryani"</em>.
+                  <em>"add Amul Taaza 500ml"</em>, or go big: <em>"order things for making biryani"</em>. You can also{" "}
+                  tap <em>📷</em> to import a cart screenshot from another app.
                 </p>
               </div>
             )}
@@ -257,6 +315,7 @@ export function InstamartChat() {
                 onShowMore={showMore}
                 onConfirmRecipe={confirmRecipe}
                 onSwapRecipe={swapRecipeOption}
+                onConfirmImport={confirmImport}
               />
             ))}
 
@@ -284,6 +343,23 @@ export function InstamartChat() {
           </div>
 
           <form onSubmit={onSubmit} className="chat-input-row">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              hidden
+              onChange={onImageChosen}
+            />
+            <button
+              type="button"
+              className="chat-attach-btn"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={sending || !hasAddress}
+              title="Import from a screenshot of another app's cart"
+              aria-label="Import from a screenshot"
+            >
+              📷
+            </button>
             <input
               value={input}
               onChange={(e) => setInput(e.target.value)}
@@ -315,9 +391,13 @@ export function InstamartChat() {
   );
 }
 
-function ChatMessage({ message, disabled, savedKeys, onChoose, onAdd, onToggleSave, onShowMore, onConfirmRecipe, onSwapRecipe }) {
+function ChatMessage({ message, disabled, savedKeys, onChoose, onAdd, onToggleSave, onShowMore, onConfirmRecipe, onSwapRecipe, onConfirmImport }) {
   if (message.type === "ingredients") {
     return <IngredientChecklist message={message} disabled={disabled} onConfirm={onConfirmRecipe} />;
+  }
+
+  if (message.type === "import") {
+    return <ImportChecklist message={message} disabled={disabled} onConfirm={onConfirmImport} />;
   }
 
   if (message.type === "recipe") {
@@ -448,10 +528,85 @@ function IngredientChecklist({ message, disabled, onConfirm }) {
   );
 }
 
+// The items read off an uploaded screenshot, shown for review before anything
+// touches the cart (the user chose review-first). Each row is editable: adjust
+// the quantity, or remove a misread/unwanted item. Confirm sends the final
+// list to the deterministic size-strict search-and-add. Renders inert once
+// confirmed (or after reloading a confirmed one).
+function ImportChecklist({ message, disabled, onConfirm }) {
+  const [items, setItems] = useState(() => (message.items || []).map((it) => ({ ...it })));
+  const confirmed = !!message.confirmed;
+
+  function setQty(idx, delta) {
+    setItems((prev) =>
+      prev.map((it, i) => (i === idx ? { ...it, quantity: Math.max(1, Math.min(20, (it.quantity || 1) + delta)) } : it))
+    );
+  }
+
+  return (
+    <div className="chat-block chat-block-assistant">
+      <div className="chat-message chat-message-assistant">
+        I read these off your screenshot — remove anything you don't want, adjust quantities, then confirm and I'll
+        find them on Instamart:
+      </div>
+      <div className={`import-list${confirmed ? " import-list--done" : ""}`}>
+        <ul className="import-rows">
+          {items.map((it, idx) => (
+            <li key={idx} className="import-row">
+              <div className="import-row-info">
+                <span className="import-row-name">{it.name}</span>
+                {it.size && <span className="import-row-size">{it.size}</span>}
+              </div>
+              {confirmed ? (
+                <span className="import-row-qty-static">×{it.quantity}</span>
+              ) : (
+                <span className="import-qty-stepper">
+                  <button type="button" onClick={() => setQty(idx, -1)} disabled={disabled} aria-label="Decrease quantity">
+                    −
+                  </button>
+                  <span>{it.quantity}</span>
+                  <button type="button" onClick={() => setQty(idx, 1)} disabled={disabled} aria-label="Increase quantity">
+                    +
+                  </button>
+                </span>
+              )}
+              {!confirmed && (
+                <button
+                  type="button"
+                  className="import-row-remove"
+                  onClick={() => setItems(items.filter((_, i) => i !== idx))}
+                  disabled={disabled}
+                  aria-label={`Remove ${it.name}`}
+                >
+                  ×
+                </button>
+              )}
+            </li>
+          ))}
+          {items.length === 0 && <li className="muted">Nothing left — nothing to import.</li>}
+        </ul>
+        {!confirmed ? (
+          <button
+            type="button"
+            className="ingredient-confirm-btn"
+            onClick={() => onConfirm(message, items)}
+            disabled={disabled || items.length === 0}
+          >
+            Confirm — add these {items.length} to my cart
+          </button>
+        ) : (
+          <p className="ingredient-confirmed-note">✓ Confirmed</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // Post-confirm recipe result: one compact row-group per ingredient, up to 3
 // small options each (tiny thumb, no big card grid — deliberate, so a 10-
 // ingredient recipe doesn't flood the chat). The added pick shows "✓ In cart";
-// tapping another swaps it in the real cart.
+// tapping another swaps it in the real cart. Reused by the screenshot-import
+// result too (a group's `note` marks exact-match-added vs pick-an-option).
 function RecipeMessage({ message, disabled, onSwap }) {
   return (
     <div className="chat-block chat-block-assistant">
@@ -460,6 +615,9 @@ function RecipeMessage({ message, disabled, onSwap }) {
         {(message.groups || []).map((g) => (
           <div key={g.ingredient} className="recipe-group">
             <p className="recipe-group-name">{g.ingredient}</p>
+            {g.note && (
+              <p className={`recipe-group-note${g.addedSpinId ? " recipe-group-note--ok" : ""}`}>{g.note}</p>
+            )}
             {(g.options || []).length === 0 ? (
               <p className="recipe-group-missing">Couldn't find this one</p>
             ) : (

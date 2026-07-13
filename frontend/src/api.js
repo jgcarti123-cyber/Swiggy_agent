@@ -65,6 +65,12 @@ export const api = {
   instamartRecipeSwap: (payload) =>
     request("/api/instamart/recipe-swap", { method: "POST", body: JSON.stringify(payload) }),
 
+  // Import-from-screenshot: send the image for extraction, confirm the list.
+  instamartImportImage: (image) =>
+    request("/api/instamart/import-image", { method: "POST", body: JSON.stringify({ image }) }),
+  instamartImportConfirm: (items) =>
+    request("/api/instamart/import-confirm", { method: "POST", body: JSON.stringify({ items }) }),
+
   // Usuals (local editable reorder list) + daily auto-add schedule.
   instamartUsuals: () => request("/api/instamart/usuals"),
   instamartSaveUsual: (product) =>

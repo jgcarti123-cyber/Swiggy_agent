@@ -9,6 +9,11 @@ export const config = {
   // June 2026 deprecation of llama-3.3-70b-versatile etc.) — overridable
   // since Groq's supported-model list shifts.
   groqModel: process.env.GROQ_MODEL || "openai/gpt-oss-120b",
+  // Separate vision-capable model for the "import from a screenshot" feature —
+  // gpt-oss-120b has no image input. llama-4-scout is Groq's multimodal model
+  // (confirmed in both the vision docs and the live models table). Overridable
+  // since Groq's model list shifts and this one is a preview model.
+  groqVisionModel: process.env.GROQ_VISION_MODEL || "meta-llama/llama-4-scout-17b-16e-instruct",
   swiggy: {
     authIssuer: "https://mcp.swiggy.com/auth",
     metadataUrl: "https://mcp.swiggy.com/.well-known/oauth-authorization-server",

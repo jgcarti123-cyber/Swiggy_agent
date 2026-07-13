@@ -21,6 +21,8 @@ import {
   getUsuals,
   confirmRecipeDirect,
   swapRecipeItemDirect,
+  importImageDirect,
+  confirmImportDirect,
 } from "../agent/instamartAgent.js";
 
 export const instamartRouter = Router();
@@ -147,16 +149,44 @@ instamartRouter.post("/recipe-confirm", async (req, res) => {
   res.json(result);
 });
 
-// Swap which option is in the cart for one recipe ingredient.
+// Swap which option is in the cart for one recipe ingredient (also used by the
+// screenshot-import flow to add/swap a not-found item's chosen option).
 instamartRouter.post("/recipe-swap", async (req, res) => {
-  const { ingredient, removeSpinId, removeSkuId, spinId, skuId } = req.body || {};
+  const { ingredient, removeSpinId, removeSkuId, spinId, skuId, quantity } = req.body || {};
   if (!spinId || !skuId) {
     res.status(400).json({ error: "VALIDATION_ERROR", message: "spinId and skuId are required" });
     return;
   }
   const addressId = requireSavedAddress(res);
   if (!addressId) return;
-  const result = await swapRecipeItemDirect({ addressId, ingredient, removeSpinId, removeSkuId, spinId, skuId });
+  const result = await swapRecipeItemDirect({ addressId, ingredient, removeSpinId, removeSkuId, spinId, skuId, quantity });
+  res.json(result);
+});
+
+// Import step 1: read line items off an uploaded screenshot of another app's
+// cart (the one vision call). Returns an editable checklist. No delivery
+// address needed yet — this is just OCR/extraction.
+instamartRouter.post("/import-image", async (req, res) => {
+  const image = req.body?.image;
+  if (typeof image !== "string" || !image.startsWith("data:image/")) {
+    res.status(400).json({ error: "VALIDATION_ERROR", message: "image must be a data:image/... URL" });
+    return;
+  }
+  const result = await importImageDirect({ image });
+  res.json(result);
+});
+
+// Import step 2: the user confirmed (possibly edited) the extracted list.
+// Deterministic from here — same pipeline as a typed order, size-strict.
+instamartRouter.post("/import-confirm", async (req, res) => {
+  const { items } = req.body || {};
+  if (!Array.isArray(items)) {
+    res.status(400).json({ error: "VALIDATION_ERROR", message: "items array is required" });
+    return;
+  }
+  const addressId = requireSavedAddress(res);
+  if (!addressId) return;
+  const result = await confirmImportDirect({ items, addressId });
   res.json(result);
 });
 

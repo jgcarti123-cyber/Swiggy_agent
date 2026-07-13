@@ -2,6 +2,7 @@ import { instamartClient } from "../mcp/instamartClient.js";
 import { runToolLoop } from "./toolLoop.js";
 import { NeedsReauthError } from "../auth/oauthClient.js";
 import { mapWithConcurrency } from "../utils/concurrency.js";
+import { extractItemsFromImage } from "./imageImport.js";
 import {
   listUsuals as dbListUsuals,
   addUsual as dbAddUsual,
@@ -1317,15 +1318,16 @@ export async function confirmRecipeDirect({ dish, ingredients, addressId }) {
 // policy as addItemDirect). Not a chat event: no transcript entry, but the
 // last recipe entry's "added" marker is updated in place so a reload renders
 // the current truth.
-export async function swapRecipeItemDirect({ addressId, ingredient, removeSpinId, removeSkuId, spinId, skuId }) {
+export async function swapRecipeItemDirect({ addressId, ingredient, removeSpinId, removeSkuId, spinId, skuId, quantity = 1 }) {
+  const qty = Math.max(1, Math.min(20, Number(quantity) || 1));
   try {
     const current = await instamartClient.getCartOrEmpty();
     const items = (current.items || [])
       .filter((i) => !(String(i.spinId) === String(removeSpinId) && String(i.skuId) === String(removeSkuId)))
       .map((i) => ({ spinId: i.spinId, skuId: i.skuId, quantity: i.quantity }));
     const already = items.find((i) => String(i.spinId) === String(spinId) && String(i.skuId) === String(skuId));
-    if (already) already.quantity += 1;
-    else items.push({ spinId, skuId, quantity: 1 });
+    if (already) already.quantity += qty;
+    else items.push({ spinId, skuId, quantity: qty });
     await instamartClient.updateCart({ selectedAddressId: addressId, items });
 
     let cart = await instamartClient.getCartOrEmpty();
@@ -1346,6 +1348,176 @@ export async function swapRecipeItemDirect({ addressId, ingredient, removeSpinId
     rethrowIfReauth(err);
     const cart = await instamartClient.getCartOrEmpty().catch(() => null);
     return { cart, error: friendlyCartError(err) };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Import-from-screenshot flow. Step 1 (importImageDirect) is the one vision
+// call — it reads product line items off an uploaded screenshot of another
+// app's cart. Step 2 (confirmImportDirect) is fully deterministic: it runs
+// each item through the SAME search/relevance/size/stock pipeline a typed
+// order uses, auto-adds the ones with an exact in-stock size match (at the
+// quantity from the screenshot), and shows up to 3 alternatives for the rest.
+// Renders through the same `recipe` message shape as §6.13 so the swap/add
+// UI is reused — a group's `quantity` (from the screenshot) flows into the
+// add so quantities are reproduced, and `note` distinguishes exact matches
+// from "couldn't find that exact item" fallbacks.
+// ---------------------------------------------------------------------------
+
+// Short display label for an extracted item, e.g. "SuperYou Protein Bar (40 g) ×2".
+function importItemLabel(item) {
+  const size = item.size ? ` (${item.size})` : "";
+  const qty = item.quantity > 1 ? ` ×${item.quantity}` : "";
+  return `${item.name}${size}${qty}`;
+}
+
+export async function importImageDirect({ image }) {
+  displayTranscript.push({ role: "user", text: "📷 Imported a screenshot" });
+  let items;
+  try {
+    items = await extractItemsFromImage(image);
+  } catch (err) {
+    // Vision runs on Groq, not Swiggy — this won't be a reauth case, but the
+    // guard is harmless and keeps the pattern uniform.
+    rethrowIfReauth(err);
+    const reply = "I couldn't read that image — try a clearer screenshot of the cart or item list.";
+    displayTranscript.push({ role: "assistant", text: reply });
+    trimConversation();
+    return { reply };
+  }
+
+  if (items.length === 0) {
+    const reply = "I couldn't spot any products in that image. Make sure it shows a cart or list of items, not just one product page.";
+    displayTranscript.push({ role: "assistant", text: reply });
+    trimConversation();
+    return { reply };
+  }
+
+  const entry = { role: "assistant", type: "import", items };
+  displayTranscript.push(entry);
+  trimConversation();
+  return { reply: "", import: { items } };
+}
+
+export async function confirmImportDirect({ items, addressId }) {
+  const clean = (items || [])
+    .map((it) => ({
+      name: String(it?.name || "").trim(),
+      size: it?.size ? String(it.size).trim() : null,
+      quantity: Math.max(1, Math.min(20, Math.round(Number(it?.quantity) || 1))),
+    }))
+    .filter((it) => it.name)
+    .slice(0, 20);
+
+  displayTranscript.push({ role: "user", text: `Import ${clean.length} item${clean.length === 1 ? "" : "s"} from the screenshot` });
+
+  // Consume the checklist entry so a reload can't re-add everything.
+  for (let i = displayTranscript.length - 1; i >= 0; i--) {
+    if (displayTranscript[i].type === "import" && !displayTranscript[i].confirmed) {
+      displayTranscript[i].confirmed = true;
+      break;
+    }
+  }
+
+  if (clean.length === 0) {
+    const reply = "Nothing left on the list to import.";
+    displayTranscript.push({ role: "assistant", text: reply });
+    trimConversation();
+    return { reply, cart: null };
+  }
+
+  try {
+    const goToIndex = await getGoToIndex(addressId);
+    // Each item -> its own group with up to 3 options and an `exact` flag.
+    // Labels are made unique so swapRecipeItemDirect can key on them.
+    const usedLabels = new Set();
+    const groups = await mapWithConcurrency(clean, 3, async (item) => {
+      let label = importItemLabel(item);
+      while (usedLabels.has(label)) label += " ·";
+      usedLabels.add(label);
+
+      try {
+        const query = item.size ? `${item.name} ${item.size}` : item.name;
+        const rawSearch = await instamartClient.searchProducts({ query, addressId });
+        const relevant = filterRelevantProducts(rawSearch, item.name);
+        cacheProducts(relevant);
+
+        const allInStock = sortVariants(flattenVariants(relevant, goToIndex)).filter((v) => v.inStock !== false);
+
+        // Strict size match (the user's choice): an item counts as "exact"
+        // only when a same-size in-stock variant exists. A size-only mismatch
+        // is treated as not-found so the user picks from options instead.
+        const req = item.size ? parseQuantityFrom(item.size) : null;
+        const sizeMatched = req ? allInStock.filter((v) => quantityMatches(req, v.quantityDescription)) : allInStock;
+        const exact = item.size ? sizeMatched.length > 0 : allInStock.length > 0;
+
+        const source = exact ? sizeMatched : allInStock;
+        return {
+          ingredient: label,
+          quantity: item.quantity,
+          exact,
+          size: item.size,
+          options: enrichProducts(source.slice(0, OPTIONS_PER_INGREDIENT)),
+        };
+      } catch (err) {
+        rethrowIfReauth(err);
+        return { ingredient: label, quantity: item.quantity, exact: false, size: item.size, options: [] };
+      }
+    });
+
+    // Auto-add only the exact matches, at the screenshot's quantity, in one
+    // real-cart-verified batch (§6.5 silent-drop lesson).
+    const exactGroups = groups.filter((g) => g.exact && g.options.length > 0);
+    let cart = null;
+    let addedCount = 0;
+    if (exactGroups.length > 0) {
+      const bestItems = exactGroups.map((g) => ({
+        spinId: g.options[0].spinId,
+        skuId: g.options[0].skuId,
+        quantity: g.quantity,
+      }));
+      const res = await addUsualsBestEffort(addressId, bestItems);
+      cart = res.cart;
+      const present = keysInCart(cart);
+      for (const g of exactGroups) {
+        const best = g.options[0];
+        if (present.has(itemKey(best.spinId, best.skuId))) {
+          g.addedSpinId = best.spinId;
+          addedCount++;
+        } else {
+          g.addedSpinId = null;
+        }
+      }
+    } else {
+      cart = await instamartClient.getCartOrEmpty().catch(() => null);
+    }
+
+    // Groups needing the user to choose: exact match not found (but options
+    // exist), plus any exact-match that failed to actually land.
+    for (const g of groups) {
+      if (g.addedSpinId) g.note = "Exact match added";
+      else if (g.options.length > 0) g.note = "No exact match — pick one:";
+    }
+
+    const notFound = groups.filter((g) => g.options.length === 0).map((g) => g.ingredient);
+    const needChoice = groups.filter((g) => !g.addedSpinId && g.options.length > 0).length;
+
+    let reply = `Read ${clean.length} item${clean.length === 1 ? "" : "s"} from your screenshot. Added ${addedCount} exact match${addedCount === 1 ? "" : "es"} to your cart`;
+    if (needChoice > 0) reply += `; ${needChoice} need${needChoice === 1 ? "s" : ""} you to pick from the options below`;
+    reply += ".";
+    if (notFound.length > 0) reply += ` Couldn't find: ${notFound.join(", ")}.`;
+
+    const entry = { role: "assistant", type: "recipe", dish: "your screenshot", reply, groups };
+    lastRecipeEntry = entry;
+    displayTranscript.push(entry);
+    trimConversation();
+    return { reply, recipe: { dish: "your screenshot", groups }, cart };
+  } catch (err) {
+    rethrowIfReauth(err);
+    const reply = `Couldn't import that list — ${friendlyCartError(err)}`;
+    displayTranscript.push({ role: "assistant", text: reply });
+    trimConversation();
+    return { reply, cart: null };
   }
 }
 
