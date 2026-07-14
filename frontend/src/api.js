@@ -65,9 +65,10 @@ export const api = {
   instamartRecipeSwap: (payload) =>
     request("/api/instamart/recipe-swap", { method: "POST", body: JSON.stringify(payload) }),
 
-  // Import-from-screenshot: send the image for extraction, confirm the list.
-  instamartImportImage: (image) =>
-    request("/api/instamart/import-image", { method: "POST", body: JSON.stringify({ image }) }),
+  // Import-from-screenshot: send the image (+ optional caption that guides
+  // extraction, e.g. "only get the snacks") for extraction, confirm the list.
+  instamartImportImage: (image, note) =>
+    request("/api/instamart/import-image", { method: "POST", body: JSON.stringify({ image, note }) }),
   instamartImportConfirm: (items) =>
     request("/api/instamart/import-confirm", { method: "POST", body: JSON.stringify({ items }) }),
 

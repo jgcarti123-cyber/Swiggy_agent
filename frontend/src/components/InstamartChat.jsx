@@ -8,6 +8,16 @@ import { ReauthNotice, isReauthError } from "./ReauthNotice.jsx";
 
 const usualKey = (item) => `${item.spinId}:${item.skuId}`;
 
+// "+" on the round attach button — matches the line-icon style used in
+// Sidebar.jsx (stroke, currentColor, rounded caps).
+function PlusIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" aria-hidden="true">
+      <path d="M12 5v14M5 12h14" />
+    </svg>
+  );
+}
+
 // Turn a /chat response into a renderable transcript message.
 function assistantMessageFromResult(result) {
   if (result.choice) {
@@ -67,6 +77,7 @@ export function InstamartChat() {
   const [usuals, setUsuals] = useState([]);
   const [schedule, setSchedule] = useState({ enabled: false, time: null });
   const [input, setInput] = useState("");
+  const [pendingImage, setPendingImage] = useState(null); // staged screenshot data URL, or null
   const [sending, setSending] = useState(false);
   const [thinkingStep, setThinkingStep] = useState(0);
   const [error, setError] = useState(null);
@@ -106,11 +117,13 @@ export function InstamartChat() {
   // action, show-more): push the user bubble immediately, run whichever API
   // call actually answers it, then render the response the same way
   // regardless of whether that call went through the LLM chat loop or one of
-  // the deterministic direct-action endpoints.
-  async function runAction(displayText, apiCall) {
+  // the deterministic direct-action endpoints. `userExtra` merges extra
+  // fields into the pushed user bubble — currently only the image thumbnail
+  // for an uploaded screenshot.
+  async function runAction(displayText, apiCall, userExtra) {
     if (sending || !hasAddress) return;
     setError(null);
-    setMessages((prev) => [...prev, { role: "user", text: displayText }]);
+    setMessages((prev) => [...prev, { role: "user", text: displayText, ...userExtra }]);
     setSending(true);
     try {
       const result = await apiCall();
@@ -133,7 +146,8 @@ export function InstamartChat() {
 
   function onSubmit(e) {
     e.preventDefault();
-    sendMsg(input);
+    if (pendingImage) sendPendingImage(input);
+    else sendMsg(input);
     setInput("");
   }
 
@@ -157,20 +171,32 @@ export function InstamartChat() {
     runAction("Clear my cart", () => api.instamartClearCart());
   }
 
-  // Screenshot upload: downscale locally, then send for extraction. Reuses
-  // runAction so it shares the thinking indicator + error/reauth handling.
+  // Screenshot upload is staged, not auto-sent: picking a file downscales it
+  // locally and shows a preview above the input row, where the user can type
+  // an optional caption (forwarded as an extraction instruction, e.g. "only
+  // get the snacks") before actually hitting Send — same as attaching a photo
+  // in any normal chat app, and the user's explicit ask: know what's being
+  // sent, and get a chance to say something about it first.
   async function onImageChosen(e) {
     const file = e.target.files?.[0];
     e.target.value = ""; // allow re-picking the same file later
     if (!file || sending || !hasAddress) return;
-    let dataUrl;
+    setError(null);
     try {
-      dataUrl = await downscaleImage(file);
+      setPendingImage(await downscaleImage(file));
     } catch (err) {
       setError(err.message);
-      return;
     }
-    runAction("📷 Imported a screenshot", () => api.instamartImportImage(dataUrl));
+  }
+
+  function sendPendingImage(caption) {
+    if (sending || !hasAddress || !pendingImage) return;
+    const trimmed = (caption || "").trim();
+    const dataUrl = pendingImage;
+    setPendingImage(null);
+    runAction(trimmed || "Imported a screenshot", () => api.instamartImportImage(dataUrl, trimmed || undefined), {
+      image: dataUrl,
+    });
   }
 
   // Import checklist confirmed (possibly edited): mark it consumed locally,
@@ -297,8 +323,8 @@ export function InstamartChat() {
                 <p className="chat-empty-title">👋 Hi, I'm Pantry Pal</p>
                 <p className="muted">
                   Try <em>"add milk"</em> and I'll ask which brand, say exactly what you want like{" "}
-                  <em>"add Amul Taaza 500ml"</em>, or go big: <em>"order things for making biryani"</em>. You can also{" "}
-                  tap <em>📷</em> to import a cart screenshot from another app.
+                  <em>"add Amul Taaza 500ml"</em>, or go big: <em>"order things for making biryani"</em>. You can also
+                  attach a cart screenshot from another app using the icon by the message box.
                 </p>
               </div>
             )}
@@ -342,28 +368,49 @@ export function InstamartChat() {
             </button>
           </div>
 
+          {pendingImage && (
+            <div className="pending-attachment">
+              <img src={pendingImage} alt="Screenshot to import" className="pending-attachment-thumb" />
+              <div className="pending-attachment-info">
+                <span className="pending-attachment-label">Ready to send</span>
+                <span className="pending-attachment-hint">
+                  Add a note below if you want (e.g. "only the snacks"), then hit Send.
+                </span>
+              </div>
+              <button
+                type="button"
+                className="pending-attachment-remove"
+                onClick={() => setPendingImage(null)}
+                disabled={sending}
+                aria-label="Remove attached screenshot"
+              >
+                ×
+              </button>
+            </div>
+          )}
+
           <form onSubmit={onSubmit} className="chat-input-row">
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="image/*"
-              hidden
-              onChange={onImageChosen}
-            />
+            <input ref={fileInputRef} type="file" accept="image/*" hidden onChange={onImageChosen} />
             <button
               type="button"
               className="chat-attach-btn"
               onClick={() => fileInputRef.current?.click()}
               disabled={sending || !hasAddress}
-              title="Import from a screenshot of another app's cart"
-              aria-label="Import from a screenshot"
+              title="Attach a screenshot of another app's cart"
+              aria-label="Attach a screenshot"
             >
-              📷
+              <PlusIcon />
             </button>
             <input
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              placeholder={hasAddress ? "What do you want to order?" : "Pick a delivery address first…"}
+              placeholder={
+                !hasAddress
+                  ? "Pick a delivery address first…"
+                  : pendingImage
+                    ? "Add a note (optional)…"
+                    : "What do you want to order?"
+              }
               disabled={sending || !hasAddress}
             />
             <button type="submit" disabled={sending || !hasAddress}>
@@ -444,6 +491,15 @@ function ChatMessage({ message, disabled, savedKeys, onChoose, onAdd, onToggleSa
         <button type="button" className="choice-chip show-more-chip" onClick={onShowMore} disabled={disabled}>
           Show more options
         </button>
+      </div>
+    );
+  }
+
+  if (message.image) {
+    return (
+      <div className={`chat-message chat-message-${message.role} chat-message--image`}>
+        <img src={message.image} alt="Uploaded screenshot" className="chat-message-thumb" />
+        {message.text && <span>{message.text}</span>}
       </div>
     );
   }

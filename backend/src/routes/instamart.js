@@ -167,12 +167,12 @@ instamartRouter.post("/recipe-swap", async (req, res) => {
 // cart (the one vision call). Returns an editable checklist. No delivery
 // address needed yet — this is just OCR/extraction.
 instamartRouter.post("/import-image", async (req, res) => {
-  const image = req.body?.image;
+  const { image, note } = req.body || {};
   if (typeof image !== "string" || !image.startsWith("data:image/")) {
     res.status(400).json({ error: "VALIDATION_ERROR", message: "image must be a data:image/... URL" });
     return;
   }
-  const result = await importImageDirect({ image });
+  const result = await importImageDirect({ image, note });
   res.json(result);
 });
 

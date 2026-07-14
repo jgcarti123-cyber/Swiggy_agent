@@ -40,7 +40,7 @@ const SYSTEM_PROMPT = `You are Pantry Pal, a grocery assistant for Swiggy Instam
 - For anything that isn't a fresh product search — removing an item, changing a quantity, clearing part of the cart, checking out — call get_cart first to see what's actually there, then update_cart with the full merged item list. You MUST actually call update_cart to make a change; never say you changed the cart without calling it.
 - Never call checkout unless the user has explicitly confirmed in this chat. For Cash on Delivery, confirm first then paymentMethod="Cash"; for UPI, call get_payment_options first.
 - The user has a personal "usuals" list (a saved reorder list). To LIST it, call get_usuals. To REMOVE something from it, call remove_from_usuals with the item name. To ADD something to it, just search_products for the item — every product card has a star (☆) the user taps to save it, so you don't add to usuals yourself; find the item and let them save it.
-- If the user asks for everything needed to MAKE or COOK a dish/meal ("order things for biryani", "I want to make pasta"), call propose_ingredients with the dish name and its essential ingredient list. Each ingredient must be a short, generic Instamart search term (e.g. "basmati rice", "curd", "mint leaves") — no brands, no quantities, no steps. Keep it minimal: only what the dish genuinely needs. The app shows the user the list to edit and confirm — do not search for the items yourself.
+- If the user asks for everything needed to MAKE or COOK a dish/meal ("order things for biryani", "I want to make pasta"), call propose_ingredients with the dish name and its essential ingredient list. Each ingredient must be a short, generic Instamart search term (e.g. "basmati rice", "curd", "mint leaves") — no brands, no quantities, no steps. Keep it minimal: only what the dish genuinely needs. Use the COMMON INDIAN GROCERY NAME for each staple, because that's what an Indian quick-commerce catalogue stocks: "curd" (NOT "yogurt" — that surfaces sweetened Greek/flavoured tubs), "coriander leaves" (NOT "cilantro"), "capsicum" (NOT "bell pepper"), "paneer" (NOT "cottage cheese"), "chana"/"rajma" for the pulse rather than "garbanzo"/"kidney bean marketing names", "curd chilli"/"green chilli" (NOT "jalapeño"). The app shows the user the list to edit and confirm — do not search for the items yourself.
 - Keep replies short — cards and the live cart render separately, don't restate them.`;
 
 // Address parameters are intentionally omitted from these schemas: the server
@@ -385,8 +385,16 @@ function significantTokens(query) {
 
 // Cheap plural/singular tolerance ("cookies" query still matches a "Cookie"
 // product name) without pulling in a stemming library.
+// Cheap plural→singular folding so "tomatoes" matches a "Tomato" product and
+// "cookies" matches "Cookie". The old version only stripped a trailing "s"
+// ("tomatoes"→"tomatoe"), which never matched "tomato" — that's exactly why a
+// "tomatoes" search fell through the relevance filter entirely and auto-added
+// a carrot. Now also strip a trailing "es".
 function tokenVariants(token) {
-  return token.length > 3 && token.endsWith("s") ? [token, token.slice(0, -1)] : [token];
+  const out = [token];
+  if (token.length > 4 && token.endsWith("es")) out.push(token.slice(0, -2)); // tomatoes→tomato, boxes→box
+  if (token.length > 3 && token.endsWith("s")) out.push(token.slice(0, -1)); // cookies→cookie, leaves→leave
+  return out;
 }
 
 function filterRelevantProducts(raw, query) {
@@ -560,6 +568,47 @@ function sortVariants(variants) {
     const pb = b.price ?? Infinity;
     return pa - pb;
   });
+}
+
+// Used only for "pick the single best option" scenarios (recipe/import
+// auto-add + top-3 alternatives) — deliberately NOT the guided browse/choose
+// picker above, which sorts cheapest-first because there the user is actively
+// comparing options themselves. Confirmed live: for "Relish Chicken Curry Cut
+// Without Skin 450 g", Swiggy's own search already ranks real chicken cuts
+// (Meat Window, JAPFA BEST, Godrej) ahead of "Suhana Chicken Masala" — the
+// masala packet sits at position 19 of 20. But sortVariants' price-ascending
+// tiebreak was promoting that ₹46 packet straight to the top over ₹150-290
+// real chicken, overriding Swiggy's own correct relevance order — which is
+// exactly why an imported "chicken curry cut" was auto-adding chicken masala.
+// This keeps mostOrdered-first (the user's own past purchases are a stronger
+// personal signal than Swiggy's generic ranking) but otherwise trusts
+// Swiggy's original order — flattenVariants already preserves it — instead
+// of re-sorting by price. Array.sort is stable (guaranteed since ES2019), so
+// returning 0 for the "otherwise" case keeps that original order intact.
+function sortForBestPick(variants) {
+  return [...variants].sort((a, b) => {
+    const moDiff = (b.mostOrdered ? 1 : 0) - (a.mostOrdered ? 1 : 0);
+    if (moDiff !== 0) return moDiff;
+    if (a.mostOrdered && b.mostOrdered) return (a.orderRank ?? 0) - (b.orderRank ?? 0);
+    return 0;
+  });
+}
+
+// From the top-N relevant variant refs, put the one to AUTO-ADD first (so the
+// recipe/import UI marks it "in cart" at the top; the rest stay as swap
+// options). Rule (the user's choice): a "most ordered by you" match wins even
+// if pricier — a personal past purchase is the strongest signal; otherwise the
+// cheapest by price. `sortForBestPick` already selected these N by relevance
+// (§chicken-vs-masala: the ₹46 masala packet never reaches the top 3, so
+// "cheapest of the 3" can't resurrect it), so this only decides WHICH of the
+// genuinely-relevant options to add.
+function orderBestFirst(refs) {
+  if (refs.length <= 1) return refs;
+  const mostOrdered = refs.filter((r) => r.mostOrdered);
+  const best = mostOrdered.length
+    ? mostOrdered.reduce((a, b) => ((a.orderRank ?? 0) <= (b.orderRank ?? 0) ? a : b))
+    : refs.reduce((a, b) => ((a.price ?? Infinity) <= (b.price ?? Infinity) ? a : b));
+  return [best, ...refs.filter((r) => r !== best)];
 }
 
 function plainTokens(text) {
@@ -1263,8 +1312,11 @@ export async function confirmRecipeDirect({ dish, ingredients, addressId }) {
         const rawSearch = await instamartClient.searchProducts({ query: ingredient, addressId });
         const raw = filterRelevantProducts(rawSearch, ingredient);
         cacheProducts(raw);
-        const inStock = sortVariants(flattenVariants(raw, goToIndex)).filter((v) => v.inStock !== false);
-        return { ingredient, options: enrichProducts(inStock.slice(0, OPTIONS_PER_INGREDIENT)) };
+        const inStock = sortForBestPick(flattenVariants(raw, goToIndex)).filter((v) => v.inStock !== false);
+        // Top-3 by relevance, then reorder so the auto-add pick (cheapest, or a
+        // past-ordered match) is first — options[0] is what gets added below.
+        const options = enrichProducts(orderBestFirst(inStock.slice(0, OPTIONS_PER_INGREDIENT)));
+        return { ingredient, options };
       } catch (err) {
         rethrowIfReauth(err);
         // One ingredient's search failing shouldn't sink the whole recipe.
@@ -1371,11 +1423,12 @@ function importItemLabel(item) {
   return `${item.name}${size}${qty}`;
 }
 
-export async function importImageDirect({ image }) {
-  displayTranscript.push({ role: "user", text: "📷 Imported a screenshot" });
+export async function importImageDirect({ image, note }) {
+  const cleanNote = String(note || "").trim().slice(0, 300) || null;
+  displayTranscript.push({ role: "user", text: cleanNote || "Imported a screenshot" });
   let items;
   try {
-    items = await extractItemsFromImage(image);
+    items = await extractItemsFromImage(image, cleanNote);
   } catch (err) {
     // Vision runs on Groq, not Swiggy — this won't be a reauth case, but the
     // guard is harmless and keeps the pattern uniform.
@@ -1442,7 +1495,7 @@ export async function confirmImportDirect({ items, addressId }) {
         const relevant = filterRelevantProducts(rawSearch, item.name);
         cacheProducts(relevant);
 
-        const allInStock = sortVariants(flattenVariants(relevant, goToIndex)).filter((v) => v.inStock !== false);
+        const allInStock = sortForBestPick(flattenVariants(relevant, goToIndex)).filter((v) => v.inStock !== false);
 
         // Strict size match (the user's choice): an item counts as "exact"
         // only when a same-size in-stock variant exists. A size-only mismatch
@@ -1452,12 +1505,15 @@ export async function confirmImportDirect({ items, addressId }) {
         const exact = item.size ? sizeMatched.length > 0 : allInStock.length > 0;
 
         const source = exact ? sizeMatched : allInStock;
+        // Top-3, then reorder so the auto-add pick (cheapest, or a past-ordered
+        // match) is first — options[0] is what an exact match auto-adds.
+        const options = enrichProducts(orderBestFirst(source.slice(0, OPTIONS_PER_INGREDIENT)));
         return {
           ingredient: label,
           quantity: item.quantity,
           exact,
           size: item.size,
-          options: enrichProducts(source.slice(0, OPTIONS_PER_INGREDIENT)),
+          options,
         };
       } catch (err) {
         rethrowIfReauth(err);

@@ -24,7 +24,17 @@ Ignore everything that is not a product the user is buying: prices, MRPs, discou
 
 Respond with ONLY a JSON object: {"items": [{"name": string, "size": string|null, "quantity": number}]}. No prose.`;
 
-export async function extractItemsFromImage(dataUrl) {
+// The user can optionally type a caption alongside the upload (e.g. "only
+// get the snacks", "double everything", "skip the drinks") — this is the
+// "ask questions" the review-checklist UI enables. It's appended as an
+// explicit user instruction the model should follow when deciding what to
+// extract, not just decorative chat text.
+function buildPrompt(instructions) {
+  if (!instructions) return EXTRACT_PROMPT;
+  return `${EXTRACT_PROMPT}\n\nThe user also gave this instruction about the image — follow it: "${instructions}"`;
+}
+
+export async function extractItemsFromImage(dataUrl, instructions) {
   const completion = await createCompletionWithRetry({
     model: config.groqVisionModel,
     temperature: 0,
@@ -34,7 +44,7 @@ export async function extractItemsFromImage(dataUrl) {
       {
         role: "user",
         content: [
-          { type: "text", text: EXTRACT_PROMPT },
+          { type: "text", text: buildPrompt(instructions) },
           { type: "image_url", image_url: { url: dataUrl } },
         ],
       },
