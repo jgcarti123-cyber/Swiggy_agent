@@ -41,13 +41,38 @@ export class SwiggyToolError extends Error {
   }
 }
 
+// Swiggy's docs have always described every tool's response as this generic
+// {success, data, message} envelope, but live inspection (going back to the
+// earliest work on this project — see ARCHITECTURE.md §2.5) consistently
+// found the actual payload arriving unwrapped, which is what every caller in
+// this codebase was built and tested against. Confirmed live in this session
+// that's no longer reliably true: get_cart's real fields turned up under
+// `.data.items` instead of `.items`, and a "banana chips" search had 20 real
+// results sitting under `.data.products` while the app checked the top-level
+// `.products`, saw nothing, and reported a false "couldn't find anything."
+// Also confirmed NOT constant — a brand-choice screen had worked moments
+// earlier in the same session — so Swiggy is inconsistent about which shape
+// a given call returns, not migrating wholesale. Unwrapping here, the one
+// chokepoint every tool call already passes through, means every caller
+// downstream always sees the same flat shape regardless of which one Swiggy
+// actually sent.
+function unwrapEnvelope(value, toolName) {
+  if (value && typeof value === "object" && typeof value.success === "boolean" && "data" in value) {
+    if (!value.success) {
+      throw new SwiggyToolError(value.message || `${toolName} reported failure`, { tool: toolName });
+    }
+    return value.data;
+  }
+  return value;
+}
+
 function extractResult(result, toolName) {
   if (result.isError) {
     const message =
       result.content?.find((c) => c.type === "text")?.text || `${toolName} call failed`;
     throw new SwiggyToolError(message, { tool: toolName });
   }
-  if (result.structuredContent) return result.structuredContent;
+  if (result.structuredContent) return unwrapEnvelope(result.structuredContent, toolName);
 
   const textBlocks = (result.content || [])
     .filter((c) => c.type === "text")
@@ -55,11 +80,13 @@ function extractResult(result, toolName) {
 
   if (textBlocks.length === 0) return null;
   if (textBlocks.length === 1) {
+    let parsed;
     try {
-      return JSON.parse(textBlocks[0]);
+      parsed = JSON.parse(textBlocks[0]);
     } catch {
       return textBlocks[0];
     }
+    return unwrapEnvelope(parsed, toolName);
   }
   return textBlocks.join("\n");
 }
