@@ -36,6 +36,7 @@ const VARIANTS_PER_PAGE = 8;
 // completions is the lever that matters, more than shrinking any one of them.
 const SYSTEM_PROMPT = `You are Pantry Pal, a grocery assistant for Swiggy Instamart in a single-user dashboard. The delivery address is already set — never ask for it; it is added to every tool call automatically.
 
+- SCOPE — this is a hard rule. You ONLY help with grocery shopping on Swiggy Instamart: finding/adding products, managing the cart, the usuals list, recipe ingredient lists, and checkout. If the user asks ANYTHING unrelated — general knowledge, trivia, capitals, math, coding, translation, current events, chit-chat, advice, or any other topic — do NOT answer it, even if you know the answer. Reply with exactly one short sentence redirecting them to groceries (e.g. "I can only help with groceries and your Instamart cart — try \\"add milk\\" or \\"order things for biryani\\".") and nothing else. Never call a tool for an off-topic request.
 - To find or add a product, call search_products with the best search term for what the user described (e.g. "milk", "chocolate cookies", "amul milk"). If they state a pack size or weight (e.g. "100g paneer", "1kg rice", "2 pieces chicken"), keep it in the query exactly as they said it — the app uses it to filter results to that exact size. The app automatically shows the user a brand choice or product cards right after your search — you never need to ask which brand or list results yourself, just search.
 - For anything that isn't a fresh product search — removing an item, changing a quantity, clearing part of the cart, checking out — call get_cart first to see what's actually there, then update_cart with the full merged item list. You MUST actually call update_cart to make a change; never say you changed the cart without calling it.
 - Never call checkout unless the user has explicitly confirmed in this chat. For Cash on Delivery, confirm first then paymentMethod="Cash"; for UPI, call get_payment_options first.
@@ -1006,6 +1007,51 @@ function buildFromBranch(kind, payload, text) {
 }
 
 // userText goes to the LLM; displayText is what the transcript shows the user.
+// ---------------------------------------------------------------------------
+// Off-topic guardrail — a ZERO-Groq-call gate that refuses obvious non-grocery
+// questions before they ever reach the model (Pantry Pal was happily answering
+// "what is the capital of india?", burning a completion per random question).
+// Deliberately HIGH-PRECISION, not high-recall: it only short-circuits when
+// it's confident a message is off-topic, so it can NEVER block a real grocery
+// request. Anything it doesn't catch still reaches the model, whose system
+// prompt now has its own hard "refuse off-topic" rule (§SYSTEM_PROMPT) as the
+// backstop — so a miss here costs one small refusal completion, not a wrong
+// answer. This is the pre-gate half of a pre-gate + LLM-backstop design.
+// ---------------------------------------------------------------------------
+
+// If any of these appear, the message plausibly concerns shopping — never
+// refuse it deterministically, let the model handle it. (Bare product names
+// like "milk" have none of these but also match no off-topic pattern below,
+// so they fall through to the model too — the safe default.)
+const SHOPPING_SIGNAL =
+  /\b(add|order|buy|purchase|get|grab|want|need|pick|remove|delete|clear|empty|reorder|checkout|check\s?out|pay|deliver|restock|search|find|show|cart|carts|usual|usuals|basket|grocery|groceries|recipe|make|cook|prepare|ingredient|ingredients)\b|\d\s*(g|kg|gm|gms|ml|l|ltr|litre|liter|pack|packet|piece|pieces|pcs|dozen|bottle|can|box|bunch)\b/i;
+
+// High-confidence off-topic patterns. Almost all are gated behind an
+// interrogative or an explicit non-grocery task verb, so plain product phrases
+// (a brand called "President", "add king chilli", etc.) don't trip them.
+const OFFTOPIC_PATTERNS = [
+  /\bcapital(s)? of\b/i,
+  /\b(whos?|whats?|when|where|why|how)\b[\s\S]*\b(country|countries|city|cities|capital|president|prime minister|pm of|population|weather|temperature|climate|history|war|movie|film|actor|actress|singer|player|team|match|score|planet|solar system|ocean|mountain|river|continent|language|currency|religion|god|festival|election|stock|bitcoin|crypto)\b/i,
+  /\bwhat('?s| is| are| was)\b[\s\S]*\b(meaning|definition|difference between|the time|the date|today'?s date|day today|square root|derivative|integral)\b/i,
+  /\b(translate|conjugate|synonym|antonym|rhyme with|spell)\b/i,
+  /\b(write|compose|draft|generate|create)\b[\s\S]*\b(poem|essay|story|song|code|program|script|email|letter|joke|paragraph|resume|cv)\b/i,
+  /\b(solve|calculate|compute|what is|whats)\b[\s\S]*\d+\s*[-+*/x×÷]\s*\d+/i, // arithmetic
+  /\b(how (are|r) (you|u|ya)|who are you|what('?s| is) your name|are you (an? )?(ai|bot|human|robot|chatgpt|gpt|llm|model))\b/i,
+  /\b(tell me a joke|sing (me )?a song|dad joke|fun fact|riddle|tongue twister)\b/i,
+  /\b(python|javascript|typescript|java|c\+\+|sql query|html|css|react|leetcode)\b/i,
+  /\b(meaning of life|who made you|who created you|are you conscious)\b/i,
+];
+
+function looksOffTopic(userText) {
+  const t = String(userText || "").trim().toLowerCase();
+  if (!t) return false;
+  if (SHOPPING_SIGNAL.test(t)) return false; // any shopping intent → let the model handle it
+  return OFFTOPIC_PATTERNS.some((re) => re.test(t));
+}
+
+const OFFTOPIC_REPLY =
+  'I can only help with groceries and your Instamart cart — try "add milk", "order things for biryani", or attach a cart screenshot.';
+
 export async function sendMessage(userText, addressId, displayText = userText) {
   displayTranscript.push({ role: "user", text: displayText });
 
@@ -1033,6 +1079,17 @@ export async function sendMessage(userText, addressId, displayText = userText) {
       trimConversation();
       return { ...responsePayload, cart: null };
     }
+  }
+
+  // Off-topic guardrail (zero Groq calls) — refuse obvious non-grocery
+  // questions here rather than letting the model answer and burn a completion.
+  // Deliberately after the brand-follow-up branch (a one-word brand answer is
+  // never off-topic) and only fires on high-confidence matches; everything
+  // else falls through to the model, which refuses off-topic on its own.
+  if (looksOffTopic(userText)) {
+    displayTranscript.push({ role: "assistant", text: OFFTOPIC_REPLY });
+    trimConversation();
+    return { reply: OFFTOPIC_REPLY, cart: null };
   }
 
   conversation.push({ role: "user", content: userText });
