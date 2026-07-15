@@ -36,7 +36,7 @@ const VARIANTS_PER_PAGE = 8;
 // completions is the lever that matters, more than shrinking any one of them.
 const SYSTEM_PROMPT = `You are Pantry Pal, a grocery assistant for Swiggy Instamart in a single-user dashboard. The delivery address is already set — never ask for it; it is added to every tool call automatically.
 
-- SCOPE — this is a hard rule. You ONLY help with grocery shopping on Swiggy Instamart: finding/adding products, managing the cart, the usuals list, recipe ingredient lists, and checkout. If the user asks ANYTHING unrelated — general knowledge, trivia, capitals, math, coding, translation, current events, chit-chat, advice, or any other topic — do NOT answer it, even if you know the answer. Reply with exactly one short sentence redirecting them to groceries (e.g. "I can only help with groceries and your Instamart cart — try \\"add milk\\" or \\"order things for biryani\\".") and nothing else. Never call a tool for an off-topic request.
+- SCOPE — this is a hard rule. You help the user SHOP on Swiggy Instamart, which is a general quick-commerce store: groceries and fresh produce, but ALSO household supplies, personal & baby care, apparel and innerwear (underwear, socks, vests…), stationery, electronics/accessories, pet supplies, and more. If it's a product someone could plausibly buy on Instamart, treat it as in scope and search for it — do NOT refuse it just because it isn't food. What you must NOT do is answer questions unrelated to shopping: general knowledge, trivia, capitals, math, coding, translation, current events, chit-chat, advice, or any other topic — do NOT answer those even if you know the answer. For an off-topic (non-shopping) request, reply with exactly one short sentence redirecting them (e.g. "I can only help you shop on Instamart — try \\"add milk\\" or \\"order things for biryani\\".") and nothing else. Never call a tool for an off-topic request.
 - To find or add a product, call search_products with the best search term for what the user described (e.g. "milk", "chocolate cookies", "amul milk"). If they state a pack size or weight (e.g. "100g paneer", "1kg rice", "2 pieces chicken"), keep it in the query exactly as they said it — the app uses it to filter results to that exact size. The app automatically shows the user a brand choice or product cards right after your search — you never need to ask which brand or list results yourself, just search.
 - For anything that isn't a fresh product search — removing an item, changing a quantity, clearing part of the cart, checking out — call get_cart first to see what's actually there, then update_cart with the full merged item list. You MUST actually call update_cart to make a change; never say you changed the cart without calling it.
 - Never call checkout unless the user has explicitly confirmed in this chat. For Cash on Delivery, confirm first then paymentMethod="Cash"; for UPI, call get_payment_options first.
@@ -398,6 +398,19 @@ function tokenVariants(token) {
   return out;
 }
 
+// A search whose literal matches are only a tiny slice of Swiggy's results is
+// the signature of a category/synonym query our keyword filter can't handle —
+// "underwear" returns 20 real products (Pepe, Jockey, XYXX…) but only 1
+// literally contains the word "underwear" (a DaMENSCH pack), because the rest
+// are named "trunk"/"brief"/"boxer". Filtering to that 1 literal match drops
+// 19 genuinely relevant products. Below this fraction, trust Swiggy's own
+// relevance instead — confirmed live this is the underwear-vs-underpants gap
+// (underpants had 0 literal matches, tripped the existing all-or-nothing
+// valve, and correctly showed everything). Food noise is unaffected: for
+// "chicken", most results literally contain "chicken" (well above this
+// threshold), so "Too Yumm Protein Chips"-class noise is still filtered out.
+const RELEVANCE_MIN_FRACTION = 0.25;
+
 function filterRelevantProducts(raw, query) {
   const products = Array.isArray(raw?.products) ? raw.products : [];
   const tokens = significantTokens(query);
@@ -406,11 +419,13 @@ function filterRelevantProducts(raw, query) {
     const haystack = `${p.displayName || ""} ${p.brand || ""}`.toLowerCase();
     return tokens.some((t) => tokenVariants(t).some((v) => haystack.includes(v)));
   });
-  // If the filter would wipe out every result (Swiggy's match was purely
-  // semantic, no literal word overlap at all), keep the unfiltered set rather
-  // than reporting a false "nothing found" — same fallback principle already
-  // used for forceBrand below when a brand name doesn't match anything exactly.
-  return relevant.length > 0 ? { ...raw, products: relevant } : raw;
+  // Keep the unfiltered set when either (a) nothing matched at all (Swiggy's
+  // match was purely semantic — same don't-report-a-false-empty principle used
+  // for forceBrand below), or (b) only a tiny fraction matched, which means the
+  // keyword filter is over-pruning a category/synonym search (see above).
+  if (relevant.length === 0) return raw;
+  if (products.length >= 8 && relevant.length / products.length < RELEVANCE_MIN_FRACTION) return raw;
+  return { ...raw, products: relevant };
 }
 
 // ---------------------------------------------------------------------------
@@ -483,6 +498,71 @@ function filterByRequestedQuantity(raw, requested) {
   const filtered = [];
   for (const p of products) {
     const keep = (p.variations || []).filter((v) => quantityMatches(requested, v.quantityDescription));
+    if (keep.length > 0) filtered.push({ ...p, variations: keep });
+  }
+  if (filtered.length === 0) return { raw, sizeMatchedAny: false };
+  return { raw: { ...raw, products: filtered }, sizeMatchedAny: true };
+}
+
+// ---------------------------------------------------------------------------
+// Clothing-size filter — "show me only size L underpants" should show only L,
+// not every size Swiggy returns. Separate from the weight/volume/count filter
+// above because a clothing size is a different dimension: Swiggy encodes it in
+// the SAME quantityDescription field as a suffix after the count ("1 L" = one,
+// size Large; "2 XL" = two, size XL; "1 M x 2" = size M multipack). The "L"
+// here is Large, NOT litre — so this only activates on a clear apparel/size
+// signal (the word "size", a full size word, an unambiguous XS/XL/XXL token,
+// or an apparel category word), never on a bare "1 L" volume (which the
+// quantity parser already owns because it has a leading number+unit).
+// ---------------------------------------------------------------------------
+const SIZE_WORDS = { "extra small": "XS", small: "S", medium: "M", large: "L", "extra large": "XL", "double xl": "XXL" };
+const APPAREL_WORDS =
+  /\b(underwear|underpants|undies|trunk|trunks|brief|briefs|boxer|boxers|vest|banian|banyan|shirt|t-?shirt|tshirt|jean|jeans|trouser|trousers|pant|pants|sock|socks|innerwear|nightwear|lingerie|bra|panty|panties|kurta|legging|leggings|pyjama|pajama)\b/i;
+// Capture groups, in priority order: full-word sizes, a letter after "size:",
+// a bare unambiguous XS/XL/XXL(X), a letter before "size", or a lone S/M/L
+// letter. The lone-letter branch (m[5]) is the loosest — it's only trusted
+// when the apparel/size gate in parseSizeFrom passes, so "L underpants" (lone
+// L + apparel) resolves but "add l" or "1 l milk" don't.
+const SIZE_QUERY_PATTERN =
+  /\b(extra small|extra large|double xl|small|medium|large)\b|\bsize[:\s-]+(xxxl|xxl|xl|xs|[sml])\b|\b(xxxl|xxl|xl|xs)\b|\b([sml])\s*size\b|\b([sml])\b/i;
+
+// The size token trailing a variant's quantityDescription: "1 L" -> L,
+// "2 XL" -> XL, "1 M x 2" -> M. Anchored right after the leading count so a
+// volume like "500 ml" (unit, not a size) can't be read as a size.
+const VARIANT_SIZE_PATTERN = /^\s*\d+\s*(XXXL|XXL|XL|XS|[SML])\b/i;
+
+// Parse a requested clothing size out of the query, but only when there's a
+// clear apparel/size signal — otherwise return null and let the weight/volume
+// path (or no filter) handle it.
+function parseSizeFrom(query) {
+  const t = String(query || "").toLowerCase();
+  const m = t.match(SIZE_QUERY_PATTERN);
+  if (!m) return null;
+  const wordMatch = m[1] && SIZE_WORDS[m[1]];
+  const token = (wordMatch || m[2] || m[3] || m[4] || m[5] || "").toUpperCase();
+  if (!token) return null;
+  // A single-letter size (S/M/L) is only trusted when the query has the word
+  // "size" or a clear apparel word — otherwise "1 l milk" / "small onions" /
+  // "large pizza" would be misread as garment sizes. XS/XL/XXL and full size
+  // words are unambiguous on their own.
+  const unambiguous = token.length >= 2 || /\bsize\b/.test(t) || APPAREL_WORDS.test(t);
+  return unambiguous ? token : null;
+}
+
+function variantSize(desc) {
+  const m = String(desc || "").match(VARIANT_SIZE_PATTERN);
+  return m ? m[1].toUpperCase() : null;
+}
+
+// Same shape/contract as filterByRequestedQuantity: narrow to the requested
+// size, or fall back to everything with sizeMatchedAny=false so the caller can
+// prepend a "couldn't find that size" notice.
+function filterByRequestedSize(raw, size) {
+  if (!size) return { raw, sizeMatchedAny: true };
+  const products = Array.isArray(raw?.products) ? raw.products : [];
+  const filtered = [];
+  for (const p of products) {
+    const keep = (p.variations || []).filter((v) => variantSize(v.quantityDescription) === size);
     if (keep.length > 0) filtered.push({ ...p, variations: keep });
   }
   if (filtered.length === 0) return { raw, sizeMatchedAny: false };
@@ -654,13 +734,20 @@ async function runSearchAndBranch(query, addressId, { forceBrand, skipBrandAsk }
   ]);
   const relevant = filterRelevantProducts(rawSearch, query);
 
-  // If the user named a pack size ("100g paneer"), narrow to matching
-  // variants BEFORE anything else (brand grouping, sorting) sees the
-  // results — so a brand that only sells a different size is never offered
-  // as a choice for this request, and "show more" only pages through
-  // genuinely matching sizes.
+  // If the user named a pack size ("100g paneer") or a clothing size ("size L
+  // underpants"), narrow to matching variants BEFORE anything else (brand
+  // grouping, sorting) sees the results — so a brand that only sells a
+  // different size is never offered as a choice for this request, and "show
+  // more" only pages through genuinely matching sizes. The two are mutually
+  // exclusive per query (a weight and a garment size don't co-occur), so
+  // whichever the query actually stated wins; parseSizeFrom only fires on a
+  // clear apparel/size signal, never on a "1 L" volume.
   const requestedQty = parseQuantityFrom(query);
-  const { raw, sizeMatchedAny } = filterByRequestedQuantity(relevant, requestedQty);
+  const requestedSize = parseSizeFrom(query);
+  const q = filterByRequestedQuantity(relevant, requestedQty);
+  const s = filterByRequestedSize(q.raw, requestedSize);
+  const raw = s.raw;
+  const sizeMatchedAny = q.sizeMatchedAny && s.sizeMatchedAny;
   cacheProducts(raw);
   let variants = flattenVariants(raw, goToIndex);
 
@@ -685,8 +772,13 @@ async function runSearchAndBranch(query, addressId, { forceBrand, skipBrandAsk }
     return { kind: "empty", payload: { query } };
   }
 
-  const sizeNotice =
-    requestedQty && !sizeMatchedAny ? `Couldn't find a ${formatQty(requestedQty)} pack — here's what's available:` : null;
+  // "Couldn't find that size" notice — names whichever the user actually
+  // asked for (pack weight/volume, or clothing size).
+  let sizeNotice = null;
+  if (!sizeMatchedAny) {
+    if (requestedQty && !q.sizeMatchedAny) sizeNotice = `Couldn't find a ${formatQty(requestedQty)} pack — here's what's available:`;
+    else if (requestedSize && !s.sizeMatchedAny) sizeNotice = `Couldn't find size ${requestedSize} — here's what's available:`;
+  }
 
   if (!effectiveForceBrand && !skipBrandAsk && brands.length >= 2) {
     // brandsOffered stays the CLEAN brand-name list — matchOfferedBrand and
@@ -1050,7 +1142,7 @@ function looksOffTopic(userText) {
 }
 
 const OFFTOPIC_REPLY =
-  'I can only help with groceries and your Instamart cart — try "add milk", "order things for biryani", or attach a cart screenshot.';
+  'I can only help you shop on Instamart — try "add milk", "order things for biryani", or attach a cart screenshot.';
 
 export async function sendMessage(userText, addressId, displayText = userText) {
   displayTranscript.push({ role: "user", text: displayText });
