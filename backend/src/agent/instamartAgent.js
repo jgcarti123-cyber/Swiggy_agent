@@ -34,7 +34,7 @@ const VARIANTS_PER_PAGE = 8;
 // despite tiny outputs, consistent with Groq's free-tier per-minute token
 // quota queuing as a session's cumulative usage climbs — fewer, smaller
 // completions is the lever that matters, more than shrinking any one of them.
-const SYSTEM_PROMPT = `You are Pantry Pal, a grocery assistant for Swiggy Instamart in a single-user dashboard. The delivery address is already set — never ask for it; it is added to every tool call automatically.
+const SYSTEM_PROMPT = `You are Insta-nt, a grocery assistant for Swiggy Instamart in a single-user dashboard. The delivery address is already set — never ask for it; it is added to every tool call automatically.
 
 - SCOPE — this is a hard rule. You help the user SHOP on Swiggy Instamart, which is a general quick-commerce store: groceries and fresh produce, but ALSO household supplies, personal & baby care, apparel and innerwear (underwear, socks, vests…), stationery, electronics/accessories, pet supplies, and more. If it's a product someone could plausibly buy on Instamart, treat it as in scope and search for it — do NOT refuse it just because it isn't food. What you must NOT do is answer questions unrelated to shopping: general knowledge, trivia, capitals, math, coding, translation, current events, chit-chat, advice, or any other topic — do NOT answer those even if you know the answer. For an off-topic (non-shopping) request, reply with exactly one short sentence redirecting them (e.g. "I can only help you shop on Instamart — try \\"add milk\\" or \\"order things for biryani\\".") and nothing else. Never call a tool for an off-topic request.
 - To find or add a product, call search_products with the best search term for what the user described (e.g. "milk", "chocolate cookies", "amul milk"). If they state a pack size or weight (e.g. "100g paneer", "1kg rice", "2 pieces chicken"), keep it in the query exactly as they said it — the app uses it to filter results to that exact size. The app automatically shows the user a brand choice or product cards right after your search — you never need to ask which brand or list results yourself, just search.
@@ -1101,7 +1101,7 @@ function buildFromBranch(kind, payload, text) {
 // userText goes to the LLM; displayText is what the transcript shows the user.
 // ---------------------------------------------------------------------------
 // Off-topic guardrail — a ZERO-Groq-call gate that refuses obvious non-grocery
-// questions before they ever reach the model (Pantry Pal was happily answering
+// questions before they ever reach the model (Insta-nt was happily answering
 // "what is the capital of india?", burning a completion per random question).
 // Deliberately HIGH-PRECISION, not high-recall: it only short-circuits when
 // it's confident a message is off-topic, so it can NEVER block a real grocery

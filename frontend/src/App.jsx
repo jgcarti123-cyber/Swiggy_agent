@@ -6,7 +6,7 @@ import { Sidebar } from "./components/Sidebar.jsx";
 
 const TABS = [
   { id: "feast", label: "Feast Finder", sub: "Compare dish prices nearby", icon: "feast" },
-  { id: "pantry", label: "Pantry Pal", sub: "Chat to fill your cart", icon: "pantry" },
+  { id: "insta-nt", label: "Insta-nt", sub: "Chat to fill your cart", icon: "insta-nt" },
 ];
 
 function App() {
@@ -21,7 +21,7 @@ function App() {
             <div className="feature-pane" hidden={active !== "feast"}>
               <DishCompare />
             </div>
-            <div className="feature-pane" hidden={active !== "pantry"}>
+            <div className="feature-pane" hidden={active !== "insta-nt"}>
               <InstamartChat />
             </div>
           </main>

@@ -42,7 +42,7 @@ db.exec(`
     created_at TEXT NOT NULL
   );
 
-  -- Local, user-editable "usuals" list for Pantry Pal. Deliberately NOT
+  -- Local, user-editable "usuals" list for Insta-nt. Deliberately NOT
   -- Swiggy's your_go_to_items (that tool is read-only — there's no Swiggy API
   -- to edit it), so the app keeps its own list here. Starts empty; the user
   -- builds it by saving items found in chat. UNIQUE(spin_id, sku_id) makes a
@@ -143,7 +143,7 @@ export function recordOrder({ domain, orderId, summary }) {
   ).run(domain, orderId ?? null, JSON.stringify(summary ?? null));
 }
 
-// --- Usuals (local, user-editable Pantry Pal list) ---
+// --- Usuals (local, user-editable Insta-nt list) ---
 function rowToUsual(row) {
   return {
     spinId: row.spin_id,

@@ -8,7 +8,7 @@ function FeastIcon() {
   );
 }
 
-function PantryIcon() {
+function InstaNtIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4Z" />
@@ -18,7 +18,7 @@ function PantryIcon() {
   );
 }
 
-const ICONS = { feast: FeastIcon, pantry: PantryIcon };
+const ICONS = { feast: FeastIcon, "insta-nt": InstaNtIcon };
 
 export function Sidebar({ tabs, active, onSelect }) {
   return (

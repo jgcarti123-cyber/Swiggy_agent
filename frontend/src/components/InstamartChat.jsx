@@ -65,7 +65,7 @@ function downscaleImage(file, maxEdge = 1600, quality = 0.82) {
   });
 }
 
-// Rotating status shown with the typing dots while Pantry Pal works. Advances
+// Rotating status shown with the typing dots while Insta-nt works. Advances
 // every couple of seconds and parks on the last line (never loops back —
 // "Almost there…" restarting as "Thinking…" reads like a hang).
 const THINKING_LINES = ["Thinking…", "Searching Instamart…", "Checking prices…", "Sorting the good stuff…", "Almost there…"];
@@ -307,7 +307,7 @@ export function InstamartChat() {
   return (
     <section className="panel instamart-panel">
       <header className="panel-header">
-        <h2>Pantry Pal</h2>
+        <h2>Insta-nt</h2>
         <p className="panel-sub">
           Tell me what you need in plain words and I'll help you pick the right brand and size.
         </p>
@@ -320,7 +320,7 @@ export function InstamartChat() {
           <div className="chat-messages">
             {messages.length === 0 && !sending && (
               <div className="chat-empty">
-                <p className="chat-empty-title">👋 Hi, I'm Pantry Pal</p>
+                <p className="chat-empty-title">👋 Hi, I'm Insta-nt</p>
                 <p className="muted">
                   Try <em>"add milk"</em> and I'll ask which brand, say exactly what you want like{" "}
                   <em>"add Amul Taaza 500ml"</em>, or go big: <em>"order things for making biryani"</em>. You can also
@@ -346,7 +346,7 @@ export function InstamartChat() {
             ))}
 
             {sending && (
-              <div className="chat-message chat-message-assistant chat-typing" aria-label="Pantry Pal is thinking">
+              <div className="chat-message chat-message-assistant chat-typing" aria-label="Insta-nt is thinking">
                 <span className="chat-typing-dots" aria-hidden="true">
                   <span></span>
                   <span></span>

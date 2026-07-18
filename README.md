@@ -3,7 +3,7 @@
 A personal, single-user, local-only dashboard built on Swiggy's official Builders Club MCP servers. One page, a sidebar, two tools:
 
 - **Feast Finder** — type a dish, see nearby open restaurants that serve it, ranked by rating, filtered by veg/non-veg/all, with item photos, LLM-estimated nutrition, and an on-demand real coupon price per item. Zero-result searches get "try instead" suggestions instead of a dead end.
-- **Pantry Pal** — a chat that turns plain text ("add milk", "order things for making biryani") into real Instamart cart actions. Broad requests get a guided brand → size picker with photos and a quantity stepper; there's an editable "usuals" list with an optional daily auto-add, and you can even import a cart screenshot from another app to reorder it here.
+- **Insta-nt** — a chat that turns plain text ("add milk", "order things for making biryani") into real Instamart cart actions. Broad requests get a guided brand → size picker with photos and a quantity stepper; there's an editable "usuals" list with an optional daily auto-add, and you can even import a cart screenshot from another app to reorder it here.
 
 Not a product, not multi-tenant — this is one person's own dashboard for their own Swiggy account, run on `localhost`. Not affiliated with or endorsed by Swiggy; built against their public Builders Club developer platform.
 
@@ -41,7 +41,7 @@ React + Vite frontend, Node/Express backend, SQLite for local state (OAuth token
 ## Docs
 
 - **`CLAUDE.md`** — the quick-reference brief: which Swiggy tools are actually called, what's verified to *not* work as documented, and the current shape of both features. Read this before changing anything that touches a Swiggy tool call.
-- **`ARCHITECTURE.md`** — the detailed record: every verified Swiggy quirk, every Groq rate-limit incident, and the full history of how Pantry Pal went from a slow pure-LLM loop to a mostly-deterministic one, with measured before/after numbers.
+- **`ARCHITECTURE.md`** — the detailed record: every verified Swiggy quirk, every Groq rate-limit incident, and the full history of how Insta-nt went from a slow pure-LLM loop to a mostly-deterministic one, with measured before/after numbers.
 
 ## Scope
 

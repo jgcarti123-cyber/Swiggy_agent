@@ -40,7 +40,7 @@ function EmptyCart({ label = "Your cart is empty" }) {
       <div className="cart-empty-state">
         <span className="cart-empty-icon" aria-hidden="true">🛒</span>
         <p className="muted">{label}</p>
-        <p className="cart-empty-hint">Ask Pantry Pal to add something.</p>
+        <p className="cart-empty-hint">Ask Insta-nt to add something.</p>
       </div>
     </div>
   );
