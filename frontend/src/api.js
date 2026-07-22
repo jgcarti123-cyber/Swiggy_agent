@@ -39,9 +39,18 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ restaurantId, menuItemId, dish, restaurantName }),
     }),
+  // Feast Finder cart. addToFoodCart takes { restaurantId, restaurantName,
+  // dish, menuItemId, quantity?, confirmReplace? } and returns
+  // { cart, added?, replaced?, needsConfirm?, currentRestaurantName?, error? }.
   addToFoodCart: (payload) =>
     request("/api/food/cart/add", { method: "POST", body: JSON.stringify(payload) }),
   getFoodCart: () => request("/api/food/cart"),
+  setFoodCartQuantity: (menuItemId, quantity) =>
+    request("/api/food/cart/set-quantity", {
+      method: "POST",
+      body: JSON.stringify({ menuItemId, quantity }),
+    }),
+  clearFoodCart: () => request("/api/food/cart/clear", { method: "POST" }),
 
   instamartCart: () => request("/api/instamart/cart"),
   instamartChatHistory: () => request("/api/instamart/chat/history"),

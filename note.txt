@@ -1,0 +1,13 @@
+Terminal 1 — backend
+
+cd "/Users/johngeorge/Desktop/Swiggy mcp/backend"
+npm run dev
+
+
+Terminal 2 — frontend
+
+cd "/Users/johngeorge/Desktop/Swiggy mcp/frontend"
+npm run dev
+
+Then open http://localhost:5173 in your browser.
+

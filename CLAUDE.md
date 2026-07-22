@@ -79,9 +79,20 @@ Real flow (do **not** rebuild around unscoped `search_menu` — see above, it do
 5. One bounded LLM call judges, across all restaurants' surviving items at once, which are *genuinely* the requested dish (real food knowledge, not keyword matching — needed because scoped `search_menu` falls back to loosely-related items instead of an empty list when a restaurant has no real match).
 6. Sort each restaurant's surviving items by rating, keep top 6.
 7. One bounded LLM call estimates protein/kcal for the final displayed item set — **a guess from the dish name, not real data**; Swiggy's tools have no nutrition field. Label it as an estimate in the UI.
-8. Sort restaurants by rating desc, distance asc. Only touch the cart (`update_food_cart`, `apply_food_coupon`) once the user clicks to actually order.
+8. Sort restaurants by rating desc, distance asc. The comparison itself never mutates the cart — the cart is only touched when the user explicitly clicks "Add to cart" (or "Check best coupon & real price", which is now non-destructive — see below).
 
 Also on the Feast Finder screen: a veg/non-veg/all pill toggle, and a "surprise me" dice button that fills the search box from a curated, veg/nonveg-tagged dish list (`frontend/src/data/dishes.js`) respecting the active filter — client-side only, no backend call.
+
+### Feast Finder cart (Add to cart) — `backend/src/food/foodCart.js`
+
+Each dish result has an **"Add to cart"** button, and a **live cart panel** (`FoodCart.jsx`) shows the current food cart with a +/- quantity stepper, item total + real "to pay", and a "Clear cart" action (placing the order still happens in the Swiggy app — the "no automated checkout" non-goal stands). This means Feast Finder now keeps a **persistent food cart** — the older claim (in `couponCheck.js` and ARCHITECTURE.md) that "this app keeps no persistent food cart" is no longer true.
+
+Behavior verified against the live server, not assumed — record any new gap in both files:
+- **`get_food_cart`'s real response carries NO restaurantId/name** — only `data.restaurant.deliverySubtitle` (an address string). Items live at `data.items[]` (`menu_item_id` is a **number**, plus `name`, `quantity`, `is_veg` (`"1"`=veg/`"2"`=non-veg), `final_price`/`subtotal`, `imageUrl`, `variants[]`); totals at `data.pricing` (`item_total`, `to_pay`), best coupon at `data.offers`. `normalizeFoodCart` parses exactly this (with defensive fallbacks).
+- Because the response has no restaurant identity, the app records which restaurant the cart belongs to in a single-row **`food_cart_meta`** table whenever it mutates the cart (this backend is the only writer). A food cart is **single-restaurant**: adding from a different one silently flushes the old cart (confirmed via the order-food recipe). So `addDishToCart` returns `{ needsConfirm, currentRestaurantName }` — **not a mutation** — when the target restaurant differs; the frontend shows a "Start a new cart?" confirm and only retries with `confirmReplace: true` on OK. A cart that predates the meta row (e.g. a leftover) reads back as unknown-restaurant → still confirmed before replacing, just without naming the old place.
+- **`update_food_cart` is treated as replace-semantics** (each call sends the complete desired item set for that restaurant), consistent with the Instamart sibling `update_cart` and the recipe's "pass all items in one call". Every add reads the cart, merges (bump the line if the dish is already there, else append), sends the full set, then **re-reads and verifies the item actually landed** (retry once) — never trusting a non-throwing call as proof, same discipline as Instamart `addItemDirect`. Removing the last line goes through `flush_food_cart` (an empty items array is rejected).
+- The backend re-searches the restaurant's menu (scoped `search_menu`) to build a correct cart item **with any `variantsV2`** (shared `toCartItem`), rather than trusting the frontend to send a payload — the frontend only sends `{ restaurantId, menuItemId, dish, quantity, confirmReplace }`.
+- **`checkBestCoupon` no longer blindly flushes** — it snapshots the existing cart, runs its throwaway single-item probe, then **restores** the original cart (or flushes if there was none). Cart adds and coupon checks share one serialized queue (`foodCartLock.js`) so they can never interleave and clobber the single global food cart.
 
 ## Feature 2: Insta-nt
 
@@ -116,7 +127,7 @@ Insta-nt's chat canvas is deliberately large (wide grid column + near-viewport-h
 
 ## Stack
 
-React + Vite frontend, Node/Express backend, SQLite for local state (OAuth client + token, saved address id, order history, the editable `usuals` list, and the `usuals_schedule` row for the daily auto-add). The backend is the only thing that talks to Swiggy MCP and holds the OAuth token; the frontend never calls Swiggy directly. The backend listens on `127.0.0.1` only (loopback), never `0.0.0.0` — it holds the live Swiggy token and exposes unauthenticated cart/order endpoints, so it must not be reachable from other devices on the network. A single interval-based scheduler (`scheduler.js`) also runs in the backend process for the daily usuals auto-add.
+React + Vite frontend, Node/Express backend, SQLite for local state (OAuth client + token, saved address id, order history, the editable `usuals` list, the `usuals_schedule` row for the daily auto-add, and the `food_cart_meta` row tracking which restaurant the current Feast Finder food cart belongs to). The backend is the only thing that talks to Swiggy MCP and holds the OAuth token; the frontend never calls Swiggy directly. The backend listens on `127.0.0.1` only (loopback), never `0.0.0.0` — it holds the live Swiggy token and exposes unauthenticated cart/order endpoints, so it must not be reachable from other devices on the network. A single interval-based scheduler (`scheduler.js`) also runs in the backend process for the daily usuals auto-add.
 
 ## Non-goals for this build
 

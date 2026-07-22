@@ -767,6 +767,38 @@ button:disabled {
   color: #fff;
 }
 
+/* Primary action per dish — filled orange so it reads as the main call to
+   action, distinct from the outlined "check coupon" button below it. */
+.item-actions {
+  margin-top: 10px;
+}
+
+.add-cart-button {
+  background: var(--orange);
+  color: #fff;
+  border: 1px solid var(--orange);
+  font-weight: 700;
+  padding: 8px 16px;
+  font-size: 0.86rem;
+}
+
+.add-cart-button:hover:not(:disabled) {
+  background: var(--orange-dark);
+  border-color: var(--orange-dark);
+}
+
+/* Already-in-cart state: quieter, outlined, so re-adds don't shout. */
+.add-cart-button--in {
+  background: var(--orange-tint);
+  color: var(--orange-dark);
+}
+
+.add-cart-button--in:hover:not(:disabled) {
+  background: var(--orange-tint-strong);
+  color: var(--orange-dark);
+  border-color: var(--orange);
+}
+
 .coupon-result {
   margin-top: 14px;
   padding: 12px 14px;
@@ -1351,6 +1383,130 @@ button:disabled {
   border-radius: 8px;
   overflow-x: auto;
   color: var(--text-muted);
+}
+
+/* -------------------------------------------------- Feast Finder food cart */
+
+/* Sticks to the top of the scroll area so it stays visible while the user
+   scrolls through restaurants and keeps adding dishes. */
+.food-cart {
+  position: sticky;
+  top: 12px;
+  z-index: 5;
+  margin-bottom: 20px;
+  border: 1px solid var(--orange-tint-strong);
+  box-shadow: var(--shadow-md);
+}
+
+.food-cart-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.food-cart-head h3 {
+  margin: 0;
+  padding: 0;
+  border: none;
+  font-size: 1.05rem;
+  font-weight: 700;
+}
+
+.food-cart-restaurant {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--orange-dark);
+  text-align: right;
+}
+
+.cart-item-thumb--empty {
+  display: inline-block;
+  background: var(--bg-subtle);
+}
+
+.food-cart-topay {
+  margin-top: 4px;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  text-align: right;
+}
+
+.food-cart-topay-note {
+  color: var(--text-muted);
+}
+
+.food-cart-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.food-cart-hint {
+  font-size: 0.76rem;
+  color: var(--text-muted);
+}
+
+/* ---------------------------------------------- switch-restaurant confirm */
+
+.confirm-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: rgba(40, 44, 63, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.confirm-card {
+  background: var(--bg);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+  padding: 22px;
+  max-width: 380px;
+  width: 100%;
+}
+
+.confirm-title {
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: var(--text-dark);
+  margin-bottom: 8px;
+}
+
+.confirm-body {
+  font-size: 0.9rem;
+  color: var(--text);
+  margin-bottom: 18px;
+}
+
+.confirm-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 14px;
+}
+
+.confirm-primary {
+  background: var(--orange);
+  color: #fff;
+  border: 1px solid var(--orange);
+  font-weight: 700;
+  padding: 9px 18px;
+}
+
+.confirm-primary:hover:not(:disabled) {
+  background: var(--orange-dark);
+  border-color: var(--orange-dark);
 }
 
 /* -------------------------------------------------------------- auth states */

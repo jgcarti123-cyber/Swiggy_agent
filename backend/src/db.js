@@ -62,6 +62,22 @@ db.exec(`
     UNIQUE(spin_id, sku_id)
   );
 
+  -- Single-row mirror of WHICH restaurant the current food cart belongs to.
+  -- get_food_cart's live response carries no restaurantId/name at all (only a
+  -- delivery-address subtitle — verified live), yet a food cart is
+  -- single-restaurant and adding from a different one silently flushes it. So
+  -- to warn before clearing on a restaurant switch, the app records the cart's
+  -- restaurant here whenever IT mutates the cart (this backend is the only
+  -- writer). Cleared when the cart is emptied/flushed. A cart that predates
+  -- this row (e.g. a leftover) reads back as unknown → treated as "some
+  -- existing cart" and still confirmed before replacing, just without a name.
+  CREATE TABLE IF NOT EXISTS food_cart_meta (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    restaurant_id TEXT,
+    restaurant_name TEXT,
+    updated_at TEXT NOT NULL
+  );
+
   -- Single-row config for the daily auto-add-usuals-to-cart schedule.
   -- last_run_date + last_status let the scheduler fire at most once per day
   -- and let the UI show a notice when a run was skipped (token expired /
@@ -196,6 +212,30 @@ export function removeUsual(spinId, skuId) {
     db.prepare(`DELETE FROM usuals WHERE spin_id = ?`).run(String(spinId));
   }
   return listUsuals();
+}
+
+// --- Food cart restaurant meta (single row; see table comment) ---
+export function getFoodCartMeta() {
+  const row = db.prepare(`SELECT * FROM food_cart_meta WHERE id = 1`).get();
+  if (!row) return { restaurantId: null, restaurantName: null };
+  return { restaurantId: row.restaurant_id, restaurantName: row.restaurant_name };
+}
+
+export function setFoodCartMeta({ restaurantId, restaurantName }) {
+  db.prepare(
+    `INSERT INTO food_cart_meta (id, restaurant_id, restaurant_name, updated_at)
+     VALUES (1, ?, ?, datetime('now'))
+     ON CONFLICT(id) DO UPDATE SET
+       restaurant_id = excluded.restaurant_id,
+       restaurant_name = excluded.restaurant_name,
+       updated_at = excluded.updated_at`
+  ).run(restaurantId != null ? String(restaurantId) : null, restaurantName ?? null);
+}
+
+export function clearFoodCartMeta() {
+  db.prepare(
+    `UPDATE food_cart_meta SET restaurant_id = NULL, restaurant_name = NULL, updated_at = datetime('now') WHERE id = 1`
+  ).run();
 }
 
 // --- Usuals daily auto-add schedule (single row) ---

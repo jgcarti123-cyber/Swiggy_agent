@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { api } from "../api.js";
 import { AddressPicker } from "./AddressPicker.jsx";
 import { ReauthNotice, isReauthError } from "./ReauthNotice.jsx";
+import { FoodCart } from "./FoodCart.jsx";
 import { DISHES } from "../data/dishes.js";
 
 const VEG_MODES = [
@@ -27,6 +28,59 @@ export function DishCompare() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [reauthError, setReauthError] = useState(null);
+  const [cart, setCart] = useState(null);
+  // A pending cross-restaurant add awaiting confirmation (adding it would clear
+  // the current cart): { restaurantId, restaurantName, dish, menuItemId,
+  // currentRestaurantName }.
+  const [pendingReplace, setPendingReplace] = useState(null);
+
+  // Load the existing food cart once an address is chosen, so a cart built in
+  // an earlier session is reflected immediately.
+  useEffect(() => {
+    if (!hasAddress) return;
+    let cancelled = false;
+    api
+      .getFoodCart()
+      .then((res) => {
+        if (!cancelled) setCart(res.cart);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [hasAddress]);
+
+  // Core add: returns the raw result so the calling ItemRow can manage its own
+  // per-button state. When Swiggy would clear a different restaurant's cart it
+  // returns needsConfirm — surfaced as a modal rather than mutating anything.
+  async function addToCart({ restaurantId, restaurantName, dish, menuItemId }, confirmReplace = false) {
+    const result = await api.addToFoodCart({
+      restaurantId,
+      restaurantName,
+      dish,
+      menuItemId,
+      quantity: 1,
+      confirmReplace,
+    });
+    if (result.needsConfirm) {
+      setPendingReplace({
+        restaurantId,
+        restaurantName,
+        dish,
+        menuItemId,
+        currentRestaurantName: result.currentRestaurantName,
+      });
+      return result;
+    }
+    if (result.cart) setCart(result.cart);
+    return result;
+  }
+
+  async function confirmReplace() {
+    const p = pendingReplace;
+    setPendingReplace(null);
+    if (p) await addToCart(p, true);
+  }
 
   async function runSearch(term, mode) {
     if (!term.trim()) return;
@@ -123,6 +177,8 @@ export function DishCompare() {
 
       {error && <p className="error-text">{error}</p>}
 
+      <FoodCart cart={cart} onCartUpdate={setCart} />
+
       {results && results.restaurants.length === 0 && (
         <div className="no-results">
           <p>No open restaurants found serving "{results.dish}" nearby.</p>
@@ -151,9 +207,37 @@ export function DishCompare() {
       {results && results.restaurants.length > 0 && (
         <ul className="restaurant-list">
           {results.restaurants.map((r) => (
-            <RestaurantCard key={r.restaurantId} restaurant={r} dish={results.dish} />
+            <RestaurantCard
+              key={r.restaurantId}
+              restaurant={r}
+              dish={results.dish}
+              cart={cart}
+              onAdd={addToCart}
+            />
           ))}
         </ul>
+      )}
+
+      {pendingReplace && (
+        <div className="confirm-overlay" role="dialog" aria-modal="true" aria-label="Switch restaurant">
+          <div className="confirm-card">
+            <p className="confirm-title">Start a new cart?</p>
+            <p className="confirm-body">
+              Your cart{pendingReplace.currentRestaurantName ? ` from ${pendingReplace.currentRestaurantName}` : ""} will
+              be cleared so you can order from{" "}
+              <strong>{pendingReplace.restaurantName || "this restaurant"}</strong>. A Swiggy cart can only hold one
+              restaurant at a time.
+            </p>
+            <div className="confirm-actions">
+              <button type="button" className="link-button" onClick={() => setPendingReplace(null)}>
+                Cancel
+              </button>
+              <button type="button" className="confirm-primary" onClick={confirmReplace}>
+                Clear &amp; add
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </section>
   );
@@ -172,7 +256,7 @@ function DiceIcon() {
   );
 }
 
-function RestaurantCard({ restaurant: r, dish }) {
+function RestaurantCard({ restaurant: r, dish, cart, onAdd }) {
   return (
     <li className="restaurant-card">
       <div className="restaurant-card-main">
@@ -191,6 +275,8 @@ function RestaurantCard({ restaurant: r, dish }) {
             dish={dish}
             restaurantId={r.restaurantId}
             restaurantName={r.restaurantName}
+            cart={cart}
+            onAdd={onAdd}
           />
         ))}
       </ul>
@@ -198,10 +284,32 @@ function RestaurantCard({ restaurant: r, dish }) {
   );
 }
 
-function ItemRow({ item, dish, restaurantId, restaurantName }) {
+function ItemRow({ item, dish, restaurantId, restaurantName, cart, onAdd }) {
   const [coupon, setCoupon] = useState(null);
   const [checking, setChecking] = useState(false);
   const [couponError, setCouponError] = useState(null);
+  const [adding, setAdding] = useState(false);
+  const [addError, setAddError] = useState(null);
+
+  // How many of THIS dish are currently in the cart (only counts when the cart
+  // is at this restaurant — a Swiggy food cart holds one restaurant at a time).
+  const inCartQty =
+    cart && !cart.empty && String(cart.restaurantId) === String(restaurantId)
+      ? cart.items.find((i) => i.menuItemId === String(item.menuItemId))?.quantity || 0
+      : 0;
+
+  async function handleAdd() {
+    setAdding(true);
+    setAddError(null);
+    try {
+      const result = await onAdd({ restaurantId, restaurantName, dish, menuItemId: item.menuItemId });
+      if (result?.error) setAddError(result.error);
+    } catch (err) {
+      setAddError(err.message || "Couldn't add to cart");
+    } finally {
+      setAdding(false);
+    }
+  }
 
   async function checkDeal() {
     setChecking(true);
@@ -243,6 +351,19 @@ function ItemRow({ item, dish, restaurantId, restaurantName }) {
             Est. ~{item.estimatedProteinGrams}g protein · ~{item.estimatedKcal} kcal
           </div>
         )}
+
+        <div className="item-actions">
+          <button
+            type="button"
+            className={`add-cart-button${inCartQty > 0 ? " add-cart-button--in" : ""}`}
+            onClick={handleAdd}
+            disabled={adding}
+          >
+            {adding ? "Adding…" : inCartQty > 0 ? `Add another (${inCartQty} in cart)` : "Add to cart"}
+          </button>
+        </div>
+
+        {addError && <p className="error-text">{addError}</p>}
 
         {!coupon && (
           <button className="deal-button" onClick={checkDeal} disabled={checking} type="button">

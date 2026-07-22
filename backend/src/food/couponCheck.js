@@ -1,24 +1,34 @@
 import { foodClient } from "../mcp/foodClient.js";
+import { withFoodCart } from "./foodCartLock.js";
+import { normalizeFoodCart, toCartItem } from "./foodCart.js";
+import { getFoodCartMeta, setFoodCartMeta, clearFoodCartMeta } from "../db.js";
+import { NeedsReauthError } from "../auth/oauthClient.js";
 
 // fetch_food_coupons returns {} in the current Swiggy MCP beta (verified live —
 // empty with or without a cart, even for a specific couponCode). Coupons only
 // surface through the cart's `offers` field: building a cart makes Swiggy
 // auto-suggest the single best coupon, and applying it yields the real
 // discount. So to price the best coupon for one item we build a throwaway
-// cart with just that item, read the coupon, then flush.
+// cart with just that item, read the coupon, then RESTORE whatever cart was
+// there before (see below).
 //
-// Food carts are single-restaurant and global, so two of these running at once
-// would clobber each other's cart — serialize with a simple promise chain.
-let queue = Promise.resolve();
+// Food carts are single-restaurant and global, so this shares the one
+// withFoodCart queue with the add-to-cart flow — a coupon check and a cart add
+// can never run interleaved and clobber each other.
 
 export function checkBestCoupon(params) {
-  const run = queue.then(() => checkBestCouponInner(params));
-  // Keep the chain alive regardless of individual success/failure.
-  queue = run.catch(() => {});
-  return run;
+  return withFoodCart(() => checkBestCouponInner(params));
 }
 
 async function checkBestCouponInner({ restaurantId, dish, menuItemId, addressId, restaurantName }) {
+  // Snapshot whatever cart the user already has, so the throwaway probe cart
+  // below can be undone. Feast Finder now keeps a real, persistent food cart
+  // (the "Add to cart" feature) — an earlier version blindly flushed here,
+  // which would silently wipe a cart the user had just built simply for
+  // checking a coupon on another dish. Empty cart → nothing to restore.
+  const savedMeta = getFoodCartMeta();
+  const saved = await readCartSafe(addressId);
+
   // Re-search rather than trust a stale menuItemId from an earlier discovery
   // call — price/stock can change between when the comparison loaded and
   // when the user clicks "check deal".
@@ -30,6 +40,7 @@ async function checkBestCouponInner({ restaurantId, dish, menuItemId, addressId,
   const items = Array.isArray(menu?.items) ? menu.items : [];
   const target = items.find((i) => String(i.menu_item_id) === menuItemId && i.inStock !== 0);
   if (!target) {
+    await restoreCart({ saved, savedMeta, addressId });
     return { available: false, reason: "This item is no longer available here." };
   }
 
@@ -72,27 +83,42 @@ async function checkBestCouponInner({ restaurantId, dish, menuItemId, addressId,
       freeDelivery: Boolean(offers.free_delivery_applied),
     };
   } finally {
-    // Always clean up — this app keeps no persistent food cart.
-    await foodClient.flushFoodCart().catch(() => {});
+    // Put the user's original cart back exactly as it was (or flush the probe
+    // if there was no cart to begin with).
+    await restoreCart({ saved, savedMeta, addressId });
   }
 }
 
-// Build an update_food_cart entry from a scoped search_menu item, selecting the
-// default (or first) variation for items that have variantsV2.
-function toCartItem(item) {
-  const entry = { menu_item_id: String(item.menu_item_id), quantity: 1 };
-  if (Array.isArray(item.variantsV2) && item.variantsV2.length > 0) {
-    entry.variantsV2 = item.variantsV2
-      .map((group) => {
-        const variations = Array.isArray(group.variations) ? group.variations : [];
-        const chosen = variations.find((v) => v.default) || variations[0];
-        if (!chosen) return null;
-        return {
-          group_id: String(group.groupId ?? group.group_id),
-          variation_id: String(chosen.id),
-        };
-      })
-      .filter(Boolean);
+async function readCartSafe(addressId) {
+  try {
+    return normalizeFoodCart(await foodClient.getFoodCart({ addressId }));
+  } catch (err) {
+    if (err instanceof NeedsReauthError) throw err;
+    return { empty: true, items: [], restaurantId: null, restaurantName: null };
   }
-  return entry;
+}
+
+// Restore the snapshotted cart after a probe. Same-restaurant lines are rebuilt
+// as {menu_item_id, quantity} (variant recovery isn't worth a re-search on the
+// restore path — the probe only ever displaced them briefly). If nothing was
+// saved, flush the probe cart.
+async function restoreCart({ saved, savedMeta, addressId }) {
+  try {
+    if (!saved || saved.empty || !savedMeta.restaurantId) {
+      await foodClient.flushFoodCart().catch(() => {});
+      // Only clear meta if there was genuinely nothing to restore.
+      if (!saved || saved.empty) clearFoodCartMeta();
+      return;
+    }
+    const cartItems = saved.items.map((i) => ({ menu_item_id: String(i.menuItemId), quantity: i.quantity }));
+    await foodClient.updateFoodCart({
+      restaurantId: savedMeta.restaurantId,
+      cartItems,
+      addressId,
+      restaurantName: savedMeta.restaurantName,
+    });
+    setFoodCartMeta(savedMeta);
+  } catch {
+    // Best-effort restore; never let cleanup throw out of the coupon check.
+  }
 }

@@ -3,6 +3,12 @@ import { foodClient } from "../mcp/foodClient.js";
 import { getSavedAddress, saveAddress, recordOrder } from "../db.js";
 import { discoverRestaurantsForDish } from "../food/discoveryAgent.js";
 import { checkBestCoupon } from "../food/couponCheck.js";
+import {
+  addDishToCart,
+  setDishQuantity,
+  clearFoodCart,
+  getFoodCartView,
+} from "../food/foodCart.js";
 
 export const foodRouter = Router();
 
@@ -120,22 +126,61 @@ foodRouter.post("/coupon-check", async (req, res) => {
 
 // --- Cart-touching endpoints: only reached once the user clicks to order ---
 
+// Add one dish (by menuItemId + dish, so the backend re-searches the
+// restaurant's menu to build a correct cart item with any variations) to the
+// food cart. A food cart is single-restaurant: adding from a different one
+// silently flushes the old cart, so this returns needsConfirm (not an error,
+// not a mutation) unless confirmReplace is set — the frontend then confirms
+// with the user before retrying. See foodCart.js for the merge/verify logic.
 foodRouter.post("/cart/add", async (req, res) => {
-  const { restaurantId, cartItems, restaurantName } = req.body;
+  const { restaurantId, restaurantName, dish, menuItemId, quantity, confirmReplace } = req.body || {};
+  if (!restaurantId || !menuItemId || !dish) {
+    res
+      .status(400)
+      .json({ error: "VALIDATION_ERROR", message: "restaurantId, menuItemId, and dish are required" });
+    return;
+  }
   const saved = getSavedAddress();
   if (!saved) {
     res.status(400).json({ error: "NO_ADDRESS", message: "Select a delivery address first" });
     return;
   }
-  await foodClient.updateFoodCart({
-    restaurantId,
-    cartItems,
+  const result = await addDishToCart({
     addressId: saved.address_id,
+    restaurantId: String(restaurantId),
     restaurantName,
+    dish: String(dish),
+    menuItemId: String(menuItemId),
+    quantity: Number(quantity) > 0 ? Number(quantity) : 1,
+    confirmReplace: Boolean(confirmReplace),
   });
-  // update_food_cart renders no widget of its own — always re-fetch the cart afterward.
-  const cart = await foodClient.getFoodCart({ addressId: saved.address_id, restaurantName });
-  res.json(cart);
+  res.json(result);
+});
+
+// Set an existing cart line's quantity (the cart panel's +/- stepper).
+// quantity <= 0 removes the line (flushing if it was the last item).
+foodRouter.post("/cart/set-quantity", async (req, res) => {
+  const { menuItemId, quantity } = req.body || {};
+  if (!menuItemId || quantity === undefined) {
+    res.status(400).json({ error: "VALIDATION_ERROR", message: "menuItemId and quantity are required" });
+    return;
+  }
+  const saved = getSavedAddress();
+  if (!saved) {
+    res.status(400).json({ error: "NO_ADDRESS", message: "Select a delivery address first" });
+    return;
+  }
+  const result = await setDishQuantity({
+    addressId: saved.address_id,
+    menuItemId: String(menuItemId),
+    quantity: Number(quantity),
+  });
+  res.json(result);
+});
+
+foodRouter.post("/cart/clear", async (req, res) => {
+  const result = await clearFoodCart();
+  res.json(result);
 });
 
 foodRouter.get("/cart", async (req, res) => {
@@ -144,11 +189,8 @@ foodRouter.get("/cart", async (req, res) => {
     res.status(400).json({ error: "NO_ADDRESS", message: "Select a delivery address first" });
     return;
   }
-  const cart = await foodClient.getFoodCart({
-    addressId: saved.address_id,
-    restaurantName: req.query.restaurantName,
-  });
-  res.json(cart);
+  const cart = await getFoodCartView({ addressId: saved.address_id });
+  res.json({ cart });
 });
 
 foodRouter.post("/cart/apply-coupon", async (req, res) => {

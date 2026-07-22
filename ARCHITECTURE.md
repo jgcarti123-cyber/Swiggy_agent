@@ -242,13 +242,21 @@ This exists because of another dead-end: `fetch_food_coupons` (the tool CLAUDE.m
 The only way to get a *real* coupon price is to build an actual cart: Swiggy auto-suggests and applies its single best coupon the moment a cart exists (visible in the cart's `offers.coupon_applied` / `offers.coupon_discount` fields). So `checkBestCoupon`:
 
 1. Re-searches the menu (fresh, not trusting a possibly-stale `menuItemId` from the original discovery call — price/stock can change between page-load and click).
-2. Builds a cart with just that one item (`update_food_cart`).
+2. **Snapshots whatever cart already exists**, then builds a probe cart with just that one item (`update_food_cart`).
 3. Reads the auto-suggested coupon code, explicitly applies it (`apply_food_coupon` — the auto-suggestion alone reports `discount: 0` until applied), then re-fetches the cart for the real discounted total.
-4. **Always flushes the cart afterward** (`flush_food_cart`, in a `finally` block) — this app keeps no persistent food cart; every check is a build-then-discard.
+4. **Restores the snapshotted cart afterward** (in a `finally` block) — or flushes if there was nothing to restore. This changed when Feast Finder gained a persistent "Add to cart" cart (§4.8): the old build-then-*flush* would have silently wiped a cart the user had just built simply for checking a coupon on another dish. So "this app keeps no persistent food cart" is no longer true.
 
-Because a Swiggy food cart is single-restaurant and global (not scoped per-session in a way this backend can parallelize), concurrent coupon checks would clobber each other's cart — so `checkBestCoupon` calls are serialized through a simple promise chain (`let queue = Promise.resolve()`), one at a time, regardless of how many "check deal" buttons the user clicks in quick succession. The check is per **item**, not per restaurant — a restaurant can show several matching items, and each has a different price, so each needs its own coupon-eligibility check.
+Because a Swiggy food cart is single-restaurant and global (not scoped per-session in a way this backend can parallelize), concurrent coupon checks — and now cart adds — would clobber each other's cart. They share **one** serialized queue (`foodCartLock.js`'s `withFoodCart`), so a coupon check and an add can never interleave. The check is per **item**, not per restaurant — a restaurant can show several matching items, and each has a different price, so each needs its own coupon-eligibility check.
 
-This is also why the UI shows a "Check best coupon & real price" button per item rather than pricing every item automatically — it's an explicit, mutating (cart-touching) action, gated behind a user click, matching the project's original rule that the cart is only touched on explicit user action.
+This is also why the UI shows a "Check best coupon & real price" button per item rather than pricing every item automatically — it's an explicit, cart-touching action, gated behind a user click.
+
+### 4.8 `foodCart.js` — the persistent Feast Finder cart
+
+Each dish result has an **"Add to cart"** button and a live cart panel (`FoodCart.jsx`) with a +/- stepper, item total + real "to pay", and "Clear cart"; the order itself is still placed in the Swiggy app (the "no automated checkout" non-goal stands).
+
+Behaviors verified live (not assumed):
+- **`get_food_cart` returns no restaurant identity** — only `data.restaurant.deliverySubtitle`. Items are at `data.items[]` (`menu_item_id` is a number; `is_veg` is `"1"`/`"2"`; price at `final_price`/`subtotal`), totals at `data.pricing`, coupon at `data.offers`. Since a food cart is single-restaurant and adding from another silently flushes it, the app tracks the cart's restaurant in a single-row **`food_cart_meta`** table (it's the only writer). `addDishToCart` returns `needsConfirm` (no mutation) when the target restaurant differs, so the UI can confirm before clearing.
+- **`update_food_cart` is treated as replace-semantics** (send the full desired item set per call — like the Instamart `update_cart` sibling and the recipe's "pass all items in one call"). Every mutation reads the cart, merges, writes the full set, then **re-reads and verifies** the item landed (retry once) — never trusting a non-throwing call. The backend re-searches the menu to build the cart item with any `variantsV2` (shared `toCartItem`); the frontend only sends ids + dish + quantity. Removing the last item goes through `flush_food_cart` (an empty items array is rejected).
 
 ---
 
