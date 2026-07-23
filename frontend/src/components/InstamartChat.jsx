@@ -127,7 +127,26 @@ export function InstamartChat() {
     setSending(true);
     try {
       const result = await apiCall();
-      setMessages((prev) => [...prev, assistantMessageFromResult(result)]);
+      setMessages((prev) => {
+        const next = [...prev, assistantMessageFromResult(result)];
+        // A real add attempt just proved this spinId can't actually be added
+        // right now (Swiggy's search said it was fine — see
+        // instamartAgent.js's markSpinOutOfStock). Grey out every already-
+        // rendered card for it in this transcript immediately, not just the
+        // one that was clicked, rather than leaving a stale "Add" button the
+        // user could click again.
+        if (!result.outOfStockSpinId) return next;
+        return next.map((m) =>
+          m.type === "products"
+            ? {
+                ...m,
+                products: m.products.map((p) =>
+                  p.spinId === result.outOfStockSpinId ? { ...p, inStock: false } : p
+                ),
+              }
+            : m
+        );
+      });
       if (result.cart) setCart(result.cart);
       if (result.usuals) setUsuals(result.usuals);
     } catch (err) {

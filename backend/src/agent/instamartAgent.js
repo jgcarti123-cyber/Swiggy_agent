@@ -195,6 +195,35 @@ const TOOLS = [
 const productBySpin = new Map();
 const productBySku = new Map();
 
+// Swiggy's search flags a variant `isInStockAndAvailable: true` while its own
+// cart step rejects it moments later — confirmed live, unpredictable from the
+// search response alone (see friendlyCartError). There's no way to know this
+// in advance, but once a REAL add attempt has proven a spinId can't actually
+// be added, that's learned for the rest of the process's life: every later
+// re-cache of this product (a new search, "show more") is forced back to
+// out-of-stock here even if Swiggy's search still claims otherwise, so the
+// user is never invited to retry a dead end. Reset only by a backend restart.
+const knownOutOfStockIds = new Set();
+
+function isKnownOutOfStock(spinId) {
+  return spinId != null && knownOutOfStockIds.has(String(spinId));
+}
+
+// Called after a real add attempt fails for a reason attributable to THIS
+// item (see isItemUnavailableError) — not for cart-level problems like a
+// stuck cart, which aren't this item's fault. Mutates the cached card object
+// in place: enrichProducts hands out this same object reference (not a copy)
+// to every past and future "products" transcript entry that resolves this
+// spinId, so this single write also retroactively corrects any already-
+// rendered history (e.g. what /chat/history returns after a reload).
+function markSpinOutOfStock(spinId) {
+  if (!spinId) return;
+  const key = String(spinId);
+  knownOutOfStockIds.add(key);
+  const card = productBySpin.get(key) || productBySku.get(key);
+  if (card) card.inStock = false;
+}
+
 function cacheProducts(raw) {
   const products = Array.isArray(raw?.products) ? raw.products : [];
   if (productBySpin.size > 500) {
@@ -214,7 +243,7 @@ function cacheProducts(raw) {
         mrp: v.price?.mrp ?? null,
         offerPrice: v.price?.offerPrice ?? v.price?.mrp ?? null,
         imageUrl: v.imageUrl || null,
-        inStock: v.isInStockAndAvailable !== false,
+        inStock: v.isInStockAndAvailable !== false && !isKnownOutOfStock(v.spinId),
       };
       productBySpin.set(card.spinId, card);
       if (card.skuId) productBySku.set(card.skuId, card);
@@ -230,7 +259,9 @@ function distinctBrands(raw) {
   const seen = new Set();
   const brands = [];
   for (const p of products) {
-    const hasInStock = (p.variations || []).some((v) => v.isInStockAndAvailable !== false);
+    const hasInStock = (p.variations || []).some(
+      (v) => v.isInStockAndAvailable !== false && !isKnownOutOfStock(v.spinId)
+    );
     if (!hasInStock) continue;
     const b = p.brand || p.variations?.[0]?.brandName;
     if (b && !seen.has(b)) {
@@ -265,7 +296,7 @@ function flattenVariants(raw, goToIndex) {
         skuId: v.skuId ? String(v.skuId) : null,
         brand: v.brandName || brand,
         displayName,
-        inStock: v.isInStockAndAvailable !== false,
+        inStock: v.isInStockAndAvailable !== false && !isKnownOutOfStock(v.spinId),
         price: v.price?.offerPrice ?? v.price?.mrp ?? null,
         mostOrdered: rank !== undefined,
         orderRank: rank,
@@ -865,6 +896,20 @@ function friendlyCartError(err) {
   return first || "something went wrong — try again.";
 }
 
+// Whether a thrown error means THIS item specifically can't be added — as
+// opposed to a cart-level problem (a stuck/"partially available" cart) that
+// isn't this item's fault and could equally block a totally different item.
+// Used to decide whether to call markSpinOutOfStock: only a real, item-
+// attributable rejection should permanently hide a product for the rest of
+// the session.
+function isItemUnavailableError(err) {
+  const first = String(err.message || "").split("\n")[0].trim();
+  if (/partially available/i.test(first)) return false;
+  return /out of stock|none of the requested items are (?:currently )?in stock|no valid items|not serviceable|cannot be added|couldn'?t be added|an error occurred|unavailable/i.test(
+    first
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Cart merge — shared by the deterministic direct-add/reorder actions below.
 // update_cart replaces the whole cart, so always read the real current
@@ -1249,6 +1294,7 @@ export async function addItemDirect({ spinId, skuId, quantity = 1, addressId, di
     return { reply, cart: null };
   }
 
+  let becameOutOfStock = false;
   try {
     cart = await mergeAndUpdateCart(addressId, [{ spinId, skuId, quantity }]);
     let landed = keysInCart(cart).has(itemKey(spinId, skuId));
@@ -1262,17 +1308,33 @@ export async function addItemDirect({ spinId, skuId, quantity = 1, addressId, di
       cart = await mergeAndUpdateCart(addressId, [{ spinId, skuId, quantity }]);
       landed = keysInCart(cart).has(itemKey(spinId, skuId));
     }
-    reply = landed
-      ? `Added ${name} to your cart ✓`
-      : `Couldn't add ${name} — Swiggy isn't letting this one be added right now, try again later.`;
+    if (landed) {
+      reply = `Added ${name} to your cart ✓`;
+    } else {
+      // Still didn't land after a retry — treat it the same as a thrown
+      // "can't be added" rejection (see isItemUnavailableError) so it's
+      // learned for the rest of the session, not just this one click.
+      markSpinOutOfStock(spinId);
+      becameOutOfStock = true;
+      reply = `Couldn't add ${name} — Swiggy isn't letting this one be added right now, try again later.`;
+    }
   } catch (err) {
     rethrowIfReauth(err);
+    if (isItemUnavailableError(err)) {
+      markSpinOutOfStock(spinId);
+      becameOutOfStock = true;
+    }
     reply = `Couldn't add ${name} — ${friendlyCartError(err)}`;
     cart = err.cart ?? null;
   }
   displayTranscript.push({ role: "assistant", text: reply });
   trimConversation();
-  return { reply, cart };
+  // outOfStockSpinId tells the frontend to retroactively greyed-out any
+  // ALREADY-rendered card for this product in the current chat session (see
+  // InstamartChat.jsx's runAction) — displayTranscript above is patched for
+  // free since enrichProducts hands out the same cached object reference,
+  // but the frontend's own already-fetched message list needs telling.
+  return { reply, cart, ...(becameOutOfStock ? { outOfStockSpinId: String(spinId) } : {}) };
 }
 
 export async function showMoreDirect({ addressId, displayText = "Show more options" }) {
