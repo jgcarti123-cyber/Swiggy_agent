@@ -11,6 +11,18 @@ const call = (name, args) => callSwiggyTool(SERVER_URL, name, args);
 // still propagate.
 const EMPTY_CART_MESSAGE = /cart not found|session expired|cart is empty|no items|no active cart|empty cart/i;
 
+// A single item's stock-validation state can "poison" get_cart entirely —
+// confirmed live, this is a genuinely different failure from the "no cart"
+// case above: get_cart throws "Item quantity is partially available" (a
+// stock check on the EXISTING cart, not caused by whatever call is reading
+// it) and keeps failing identically on every subsequent read until something
+// rewrites the cart. clear_cart succeeds even while get_cart is stuck this
+// way, and reads work normally again immediately after — confirmed live by
+// the cart self-healing the moment an unrelated real cart write happened.
+// Scoped to this exact phrase (not a blanket catch-all) so a read failure is
+// never treated as license to wipe the cart for some unrelated reason.
+const STUCK_CART_MESSAGE = /partially available/i;
+
 // update_cart is idempotent — it always REPLACES the cart with the given item
 // list, so calling it again with the identical payload lands on the same end
 // state, never a duplicate side effect. It's also empirically flaky: the
@@ -47,13 +59,27 @@ export const instamartClient = {
 
   // getCart, but "no cart yet" comes back as a normal empty cart instead of a
   // thrown tool error — so the UI shows "Cart is empty" rather than a scary
-  // support/report-id message. Only the empty case is swallowed.
+  // support/report-id message. A stuck cart (see STUCK_CART_MESSAGE) gets one
+  // auto-recovery attempt — clear, then re-read — so the Cart panel self-
+  // heals instead of showing a dead-end error until some unrelated cart
+  // write happens to fix it. Any other error still propagates untouched.
   getCartOrEmpty: async () => {
     try {
       return await call("get_cart", {});
     } catch (err) {
       if (err instanceof SwiggyToolError && EMPTY_CART_MESSAGE.test(err.message)) {
         return { items: [], empty: true };
+      }
+      if (err instanceof SwiggyToolError && STUCK_CART_MESSAGE.test(err.message)) {
+        await call("clear_cart", {}).catch(() => {});
+        try {
+          return await call("get_cart", {});
+        } catch (err2) {
+          if (err2 instanceof SwiggyToolError && EMPTY_CART_MESSAGE.test(err2.message)) {
+            return { items: [], empty: true };
+          }
+          throw err2;
+        }
       }
       throw err;
     }
