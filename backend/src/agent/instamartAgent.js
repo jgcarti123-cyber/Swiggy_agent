@@ -842,20 +842,25 @@ function rethrowIfReauth(err) {
 // Maps Swiggy's raw tool errors to a short, actionable phrase that completes
 // the sentence "Couldn't add X — ...". Swiggy's own text is verbose (multi-line
 // with report ids/support email) and, for some errors, not user-actionable.
-// Notably, some fresh-meat items report as fully in-stock in search yet
-// update_cart rejects them ("No valid items in cart" / "An error occurred") —
-// confirmed unpredictable from the search data, so those just get a clean
-// "not available, try another" rather than a raw dump.
+// Notably, some items report as fully in-stock in search yet update_cart
+// rejects them anyway — confirmed live (reproduced directly against the
+// server) for two DIFFERENT real rejection reasons on two DIFFERENT items:
+// "None of the requested items are currently in stock" (genuinely out of
+// stock despite the search flag) and "no valid items remained..." (rejected
+// for no reason visible in the search data at all — not a size/brand issue,
+// Swiggy just won't take it right now). Both are unpredictable from search
+// results, so neither gets a raw dump, but they're told apart so the advice
+// matches what's actually true.
 function friendlyCartError(err) {
   const first = String(err.message || "").split("\n")[0].trim();
   if (/partially available/i.test(first)) {
     return `the cart may be stuck — tap "Clear cart" below to reset it, then try again.`;
   }
-  if (/out of stock/i.test(first)) {
+  if (/out of stock|none of the requested items are (?:currently )?in stock/i.test(first)) {
     return "it's out of stock right now — try another option.";
   }
   if (/no valid items|not serviceable|cannot be added|couldn'?t be added|an error occurred|unavailable/i.test(first)) {
-    return "Swiggy isn't letting this one be added right now — try a different size or brand.";
+    return "Swiggy rejected this item right now — try again in a bit, or pick something else.";
   }
   return first || "something went wrong — try again.";
 }
