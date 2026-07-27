@@ -1,4 +1,4 @@
-function FeastIcon() {
+function FeasterIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <path d="M3 2v7c0 1.1.9 2 2 2h4a2 2 0 0 0 2-2V2" />
@@ -18,7 +18,7 @@ function InstaNtIcon() {
   );
 }
 
-const ICONS = { feast: FeastIcon, "insta-nt": InstaNtIcon };
+const ICONS = { feaster: FeasterIcon, "insta-nt": InstaNtIcon };
 
 export function Sidebar({ tabs, active, onSelect }) {
   return (
@@ -40,7 +40,7 @@ export function Sidebar({ tabs, active, onSelect }) {
       <nav className="nav">
         <p className="nav-heading">Choose a service</p>
         {tabs.map((tab) => {
-          const Icon = ICONS[tab.icon] || FeastIcon;
+          const Icon = ICONS[tab.icon] || FeasterIcon;
           const isActive = active === tab.id;
           return (
             <button

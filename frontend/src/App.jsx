@@ -5,12 +5,12 @@ import { InstamartChat } from "./components/InstamartChat.jsx";
 import { Sidebar } from "./components/Sidebar.jsx";
 
 const TABS = [
-  { id: "feast", label: "Feast Finder", sub: "Compare dish prices nearby", icon: "feast" },
+  { id: "feaster", label: "Feaster", sub: "Compare dish prices nearby", icon: "feaster" },
   { id: "insta-nt", label: "Insta-nt", sub: "Chat to fill your cart", icon: "insta-nt" },
 ];
 
 function App() {
-  const [active, setActive] = useState("feast");
+  const [active, setActive] = useState("feaster");
 
   return (
     <div className="app">
@@ -18,7 +18,7 @@ function App() {
       <div className="main">
         <AuthGate>
           <main className="content">
-            <div className="feature-pane" hidden={active !== "feast"}>
+            <div className="feature-pane" hidden={active !== "feaster"}>
               <DishCompare />
             </div>
             <div className="feature-pane" hidden={active !== "insta-nt"}>

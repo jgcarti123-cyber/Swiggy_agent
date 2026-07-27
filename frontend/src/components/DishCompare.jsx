@@ -129,7 +129,7 @@ export function DishCompare() {
   return (
     <section className="panel">
       <header className="panel-header">
-        <h2>Feast Finder</h2>
+        <h2>Feaster</h2>
         <p className="panel-sub">
           Type a dish and see open restaurants near you, ranked by rating, with veg or non-veg
           options for that dish and their real coupon price.

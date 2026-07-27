@@ -39,7 +39,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ restaurantId, menuItemId, dish, restaurantName }),
     }),
-  // Feast Finder cart. addToFoodCart takes { restaurantId, restaurantName,
+  // Feaster cart. addToFoodCart takes { restaurantId, restaurantName,
   // dish, menuItemId, quantity?, confirmReplace? } and returns
   // { cart, added?, replaced?, needsConfirm?, currentRestaurantName?, error? }.
   addToFoodCart: (payload) =>

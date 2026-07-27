@@ -2,7 +2,7 @@
 
 This is a personal, single-user, local-only dashboard with two features:
 
-1. **Feast Finder** — type a dish, see nearby open restaurants ranked by rating, filtered by a veg/non-veg/all toggle, with up to 6 matching menu items per restaurant (photos, LLM-estimated nutrition), a "surprise me" dish randomiser, and an on-demand real coupon price per item. When a search finds nothing, broader "try instead" suggestions are offered instead of a dead end.
+1. **Feaster** — type a dish, see nearby open restaurants ranked by rating, filtered by a veg/non-veg/all toggle, with up to 6 matching menu items per restaurant (photos, LLM-estimated nutrition), a "surprise me" dish randomiser, and an on-demand real coupon price per item. When a search finds nothing, broader "try instead" suggestions are offered instead of a dead end.
 2. **Insta-nt** — a chat box that turns free-text ("add milk") into real Instamart cart actions. Broad requests get a guided brand → variant picker with photos and a cart quantity stepper. Most of this guided flow and every cart mutation is **deterministic backend code, not the model deciding** — this is the single biggest architectural fact about this feature and is covered in depth in §6.
 
 Both features are built on Swiggy's official MCP (Model Context Protocol) servers, which expose Swiggy's food-ordering and grocery-ordering capabilities as a set of callable tools rather than a REST API. Everything runs on `localhost`. There is no multi-user support, no production deployment — this document assumes you're reading it to understand *why* the code is shaped the way it is, not just what it does.
@@ -73,12 +73,12 @@ These are thin, typed wrappers around `callSwiggyTool`, one function per Swiggy 
 
 ### 2.4 A crucial, hard-won fact: `search_menu`'s real behavior
 
-`search_menu` has two modes, and this shaped the entire Feast Finder design:
+`search_menu` has two modes, and this shaped the entire Feaster design:
 
 - **Scoped** (`restaurantIdOfAddedItem` set): searches one restaurant's menu for a dish. Works reliably.
 - **Unscoped** (`restaurantIdOfAddedItem` omitted): per Swiggy's own tool description, this should search *across* restaurants near an address — i.e. exactly "find restaurants serving dish X." **Verified live, repeatedly, across many dishes and addresses: it always returns zero results.** This is the mechanism the original project design (`CLAUDE.md`) was built around, and it simply doesn't work in the current Swiggy MCP beta.
 
-Because of this, Feast Finder cannot do "one search call, get restaurants back." Instead it does `search_restaurants` (a restaurant **name/cuisine-tag** text match, which works, but is not a dish search) to get candidates, then *scoped* `search_menu` per candidate restaurant. This is the origin of the whole agent-based discovery pipeline in §4 — including a second-order problem it creates (§4.5): `search_restaurants` finds nothing for a dish whose name doesn't literally appear in any nearby restaurant's name or cuisine tags, even when a real match exists two streets over under a different label.
+Because of this, Feaster cannot do "one search call, get restaurants back." Instead it does `search_restaurants` (a restaurant **name/cuisine-tag** text match, which works, but is not a dish search) to get candidates, then *scoped* `search_menu` per candidate restaurant. This is the origin of the whole agent-based discovery pipeline in §4 — including a second-order problem it creates (§4.5): `search_restaurants` finds nothing for a dish whose name doesn't literally appear in any nearby restaurant's name or cuisine tags, even when a real match exists two streets over under a different label.
 
 A second, related discovery: scoped `search_menu` **also doesn't return empty when a restaurant has no real match** — it falls back to returning loosely-related items from that restaurant's menu instead of an empty list (verified: querying "butter chicken" at a biryani specialist returned 10 items, none of them butter chicken). This is why there's an LLM relevance-judgment step, not just a raw pass-through of whatever `search_menu` returns (§4.4).
 
@@ -140,7 +140,7 @@ The token is **only ever stored in SQLite on the backend** — the frontend neve
 
 ---
 
-## 4. Feature 1: Feast Finder (`backend/src/food/`)
+## 4. Feature 1: Feaster (`backend/src/food/`)
 
 ### 4.1 The route: `GET /api/food/compare?dish=...&vegMode=...`
 
@@ -244,13 +244,13 @@ The only way to get a *real* coupon price is to build an actual cart: Swiggy aut
 1. Re-searches the menu (fresh, not trusting a possibly-stale `menuItemId` from the original discovery call — price/stock can change between page-load and click).
 2. **Snapshots whatever cart already exists**, then builds a probe cart with just that one item (`update_food_cart`).
 3. Reads the auto-suggested coupon code, explicitly applies it (`apply_food_coupon` — the auto-suggestion alone reports `discount: 0` until applied), then re-fetches the cart for the real discounted total.
-4. **Restores the snapshotted cart afterward** (in a `finally` block) — or flushes if there was nothing to restore. This changed when Feast Finder gained a persistent "Add to cart" cart (§4.8): the old build-then-*flush* would have silently wiped a cart the user had just built simply for checking a coupon on another dish. So "this app keeps no persistent food cart" is no longer true.
+4. **Restores the snapshotted cart afterward** (in a `finally` block) — or flushes if there was nothing to restore. This changed when Feaster gained a persistent "Add to cart" cart (§4.8): the old build-then-*flush* would have silently wiped a cart the user had just built simply for checking a coupon on another dish. So "this app keeps no persistent food cart" is no longer true.
 
 Because a Swiggy food cart is single-restaurant and global (not scoped per-session in a way this backend can parallelize), concurrent coupon checks — and now cart adds — would clobber each other's cart. They share **one** serialized queue (`foodCartLock.js`'s `withFoodCart`), so a coupon check and an add can never interleave. The check is per **item**, not per restaurant — a restaurant can show several matching items, and each has a different price, so each needs its own coupon-eligibility check.
 
 This is also why the UI shows a "Check best coupon & real price" button per item rather than pricing every item automatically — it's an explicit, cart-touching action, gated behind a user click.
 
-### 4.8 `foodCart.js` — the persistent Feast Finder cart
+### 4.8 `foodCart.js` — the persistent Feaster cart
 
 Each dish result has an **"Add to cart"** button and a live cart panel (`FoodCart.jsx`) with a +/- stepper, item total + real "to pay", and "Clear cart"; the order itself is still placed in the Swiggy app (the "no automated checkout" non-goal stands).
 
@@ -277,14 +277,14 @@ The project originally used Anthropic's SDK with its native MCP connector (a hos
 
 ### 6.1 `toolLoop.js` — the hand-rolled agent loop
 
-Since Groq won't execute tools for us, this is a manual implementation of the same idea, shared by Feast Finder's bounded single-purpose calls (§4) and Insta-nt's multi-turn chat:
+Since Groq won't execute tools for us, this is a manual implementation of the same idea, shared by Feaster's bounded single-purpose calls (§4) and Insta-nt's multi-turn chat:
 
 1. Send the conversation + tool definitions to Groq.
 2. If the model's response has no `tool_calls`, we're done — return its text.
 3. If it does, execute each requested tool call — **concurrently** if the model batched several into one turn — via `executeTool(name, args)`.
 4. Push a `role: "tool"` message per result back into the conversation, and loop back to step 1.
 5. Two independent ways a call can end the loop *without* costing another completion:
-   - **`finalToolNames`** — the model itself calls a designated tool, and its arguments are handed back to the caller without ever being executed (used historically for Feast Finder's now-superseded discovery-loop pattern and the second-version `ask_choice`/`present_products` tools — see §6.4).
+   - **`finalToolNames`** — the model itself calls a designated tool, and its arguments are handed back to the caller without ever being executed (used historically for Feaster's now-superseded discovery-loop pattern and the second-version `ask_choice`/`present_products` tools — see §6.4).
    - **The `__endLoop` sentinel** — `executeTool` itself can resolve to `{ __endLoop: true, kind, payload }`. The tool *did* run for real (its side effects happened, e.g. a real `search_products` call), but the *caller's own code*, not the model, has already decided what the final answer is from the result — so there's no reason to feed it back and pay for a second completion just to have the model restate a decision that was already made deterministically. This is the mechanism that makes §6.4's guided search work in one completion instead of two.
 
 The generic loop doesn't know or care *why* something ended it — both mechanisms converge to the same `{ text, finalArgs, finalToolName, executedTools }` return shape.
@@ -298,7 +298,7 @@ Everything downstream of "the model decided to search, or decided to edit the ca
 - **Address**: resolved server-side from the saved address and injected into every tool call by `makeExecuteTool(addressId)` — the model never sees, asks for, or reasons about one. This alone removed an entire `get_addresses` round-trip (and the address-list JSON) from every turn.
 - **Search results and cart reads/writes are compacted before the model ever sees them** — `compactForModel`/`compactSearchResult` strip heavy media/description fields and cap arrays from `search_products`/`your_go_to_items` results (still shown to the model for the free-text-question case, e.g. "what are my usuals?"); `compactCartForModel` strips `get_cart`/`update_cart`'s large `selectedAddressDetails` and formatted `billBreakdown` block down to just `{items: [{spinId, skuId, itemName, quantity, price}], total}` for the LLM tool-calling path (the deterministic direct actions below use the *real* uncompacted client directly, since they're not paying any token cost either way).
 - **Conversation history is trimmed** to the last 8 user turns; the two transcripts (`conversation`, what the LLM sees, vs `displayTranscript`, what the UI renders — rich choice/product messages) are kept separate so trimming the LLM's context never drops something the UI needs to redraw on reload.
-- **`max_tokens: 1024`** for the chat loop (Feast Finder's bounded calls use their own, smaller budgets per call — see §4.2).
+- **`max_tokens: 1024`** for the chat loop (Feaster's bounded calls use their own, smaller budgets per call — see §4.2).
 
 **Off-topic guardrail (pre-gate + LLM backstop).** Reported live: Insta-nt was answering pure general-knowledge questions ("what is the capital of india?"), burning one Groq completion each — exactly the token waste the whole two-tier design exists to avoid. The fix is two layers, matching the guardrail everything else in this feature follows (cheap deterministic gate first, model only for what genuinely needs it):
 - **A zero-Groq-call pre-gate** (`looksOffTopic`, run in `sendMessage` after the deterministic brand-follow-up branch, before the tool loop). It is deliberately **high-precision, not high-recall**: it refuses only when confident a message is off-topic, so it can never block a real grocery request. Concretely, it passes anything containing a shopping signal (`add`/`order`/`remove`/`cart`/`recipe`/a quantity like "2 pieces"/etc.) straight to the model, and otherwise refuses only if the message matches a curated off-topic pattern — and those patterns are gated behind interrogatives or explicit non-grocery task verbs ("capital of", "who is the president", "translate", "write a poem", "solve 5+3", "how are you"), so a bare product phrase or a brand that happens to contain a flagged word doesn't trip them. A caught message returns a fixed redirect line with no LLM call at all.
@@ -395,7 +395,7 @@ All five update `displayTranscript` directly (so the UI's rich rendering stays c
 
 **The problem:** `search_products`, like `search_menu` on the Food server (§2.4), doesn't return empty when nothing genuinely matches — it falls back to loosely/semantically related items. Confirmed live: searching "chicken" surfaced "Too Yumm Protein Chips" (no literal relation to chicken at all) mixed in alongside real chicken products, and this reached the user as an apparently-broken guided picker.
 
-**Why not another LLM relevance-judgment call** (mirroring Feast Finder's `judgeRelevantItems`, §4.4): §6.3's whole point was measuring that per-turn LLM calls were the actual latency/cost problem for this feature (129s for one guided add), and the fix was replacing model judgment with deterministic code wherever the decision didn't actually need real reasoning. A relevance *filter* on product names is exactly that kind of decision.
+**Why not another LLM relevance-judgment call** (mirroring Feaster's `judgeRelevantItems`, §4.4): §6.3's whole point was measuring that per-turn LLM calls were the actual latency/cost problem for this feature (129s for one guided add), and the fix was replacing model judgment with deterministic code wherever the decision didn't actually need real reasoning. A relevance *filter* on product names is exactly that kind of decision.
 
 **The fix (`filterRelevantProducts` in `instamartAgent.js`):** tokenize the query into its significant words (lowercased, stopwords like "a"/"add"/"my" stripped, with a cheap plural/singular tolerance — "cookies" still matches a "Cookie" product name), then keep only products whose `displayName` or `brand` contains at least one of those words. This is applied once, at the top of `runSearchAndBranch`, before caching or branching, so every downstream consumer (brand grouping, variant cards, "show more" pagination) sees the same filtered set.
 
@@ -438,7 +438,7 @@ All five update `displayTranscript` directly (so the UI's rich rendering stays c
 
 **Step 1 — the model proposes, inside its tool call.** A new LLM tool, `propose_ingredients(dish, ingredients[])`, has the model generate the essential-ingredient list *in the tool-call arguments themselves* — there is no second "planning" completion, no search results fed back for judgment. The system prompt constrains the list to short, generic, brand-free Instamart search terms, and specifically to **Indian grocery names, not US English** — "curd" not "yogurt", "coriander leaves" not "cilantro", "capsicum" not "bell pepper", "paneer" not "cottage cheese". Confirmed live this mattered: "yogurt" as a search term surfaces sweetened Greek/flavoured tubs (Epigamia, Pride of Cows) because that's what's branded "yogurt" on Instamart, while "curd" correctly returns plain dahi — the item Indian recipes actually mean. `executeTool` sanitizes (trim/dedupe/cap 16) and ends the loop via the `__endLoop` sentinel (§6.1) with a new branch kind, `ingredients` — rendered as an editable checklist (chips with ×, an add-ingredient input, a Confirm button). The user, not the model, owns the final list.
 
-**Step 2 — Confirm is fully deterministic** (`confirmRecipeDirect`, `POST /recipe-confirm`, zero Groq calls). The confirmed list fans out through `mapWithConcurrency(…, 3)` — the same throttle-don't-Promise.all reasoning as Feast Finder's menu fan-out — and each ingredient runs the *identical* pipeline as a normal guided search: relevance filter (§6.10), go-to cross-reference (§6.9), image side-channel (§6.7), then **`sortForBestPick`, not the guided picker's price-ascending `sortVariants`** (§6.10's "best pick" note above) — the top 3 in-stock options are kept in Swiggy's own relevance order (mostOrdered still first). Which of those 3 gets auto-added is then decided by `orderBestFirst`: a "most ordered by you" match wins even if pricier, otherwise the cheapest of the 3 — confirmed live (e.g. a 1kg Basmati rice pick correctly chose the ₹90 single-pack over a ₹270 3-pack that had sorted higher by relevance alone). All picks land in one `addUsualsBestEffort` batch (§6.11), so the reply's "Added N of M" counts come from the verified real cart, never call success. Ingredients with zero relevant in-stock results render as "couldn't find" and are named in the reply; one ingredient's search failure can't sink the rest.
+**Step 2 — Confirm is fully deterministic** (`confirmRecipeDirect`, `POST /recipe-confirm`, zero Groq calls). The confirmed list fans out through `mapWithConcurrency(…, 3)` — the same throttle-don't-Promise.all reasoning as Feaster's menu fan-out — and each ingredient runs the *identical* pipeline as a normal guided search: relevance filter (§6.10), go-to cross-reference (§6.9), image side-channel (§6.7), then **`sortForBestPick`, not the guided picker's price-ascending `sortVariants`** (§6.10's "best pick" note above) — the top 3 in-stock options are kept in Swiggy's own relevance order (mostOrdered still first). Which of those 3 gets auto-added is then decided by `orderBestFirst`: a "most ordered by you" match wins even if pricier, otherwise the cheapest of the 3 — confirmed live (e.g. a 1kg Basmati rice pick correctly chose the ₹90 single-pack over a ₹270 3-pack that had sorted higher by relevance alone). All picks land in one `addUsualsBestEffort` batch (§6.11), so the reply's "Added N of M" counts come from the verified real cart, never call success. Ingredients with zero relevant in-stock results render as "couldn't find" and are named in the reply; one ingredient's search failure can't sink the rest.
 
 **The options render compact by design** — a new `recipe` transcript type with small thumb-rows (34px), not the big product-card grid: a 12-ingredient result would otherwise be ~36 full cards of scrolling. The auto-added pick is highlighted "✓ In cart"; every other row has a Swap button.
 
@@ -490,7 +490,7 @@ The load-bearing subtlety is that **"L" is Large *or* Litre**, and the two must 
 
 Plain React + Vite, no state-management library — each panel owns its own `useState`.
 
-- **`App.jsx`** — a sidebar (`Sidebar.jsx`) toggles between two `hidden`-attribute-gated panes: `DishCompare` (Feast Finder) and `InstamartChat` (Insta-nt). Both are always mounted, only visibility toggles, so switching tabs never loses in-progress state.
+- **`App.jsx`** — a sidebar (`Sidebar.jsx`) toggles between two `hidden`-attribute-gated panes: `DishCompare` (Feaster) and `InstamartChat` (Insta-nt). Both are always mounted, only visibility toggles, so switching tabs never loses in-progress state.
 - **`AuthGate.jsx`** wraps everything — checks `/auth/status` on load, shows a "Connect Swiggy account" link (→ `/auth/login`, handled entirely server-side) if not authenticated.
 - **`api.js`** is a thin `fetch` wrapper (`request(path, options)`) with one piece of shared logic: a 401 (or `error: "NEEDS_REAUTH"`) response throws a typed `ApiError` that callers check with `isReauthError(err)` to show a re-auth prompt instead of a generic error (`ReauthNotice.jsx` is the shared UI for it). It also exposes the deterministic direct-action endpoints (§6.8) as distinct methods alongside `instamartChatSend`.
 - **`AddressPicker.jsx`** — shared between both panels; lists saved addresses via the Food `/api/food/addresses` route and persists the chosen one server-side. Insta-nt's address bar sits at the top of the panel, not inside the chat itself — the chat agent never asks for an address (§6.2).
@@ -498,7 +498,7 @@ Plain React + Vite, no state-management library — each panel owns its own `use
 - **`InstamartChat.jsx`** — renders the chat transcript, including five message types beyond plain text: `choice` (clickable brand chips, including the dashed "Any brand" option, §6.4), `products` (an image-card grid, each with a price, an Add button, and a ☆ save-to-usuals toggle, out-of-stock ones visibly marked and disabled, §6.5/§6.11), `ingredients` (the recipe checklist, §6.13 — chip edits are local component state until Confirm), `import` (the screenshot-import review checklist, §6.15 — editable qty steppers + remove, local state until Confirm), and `recipe` (compact per-ingredient/per-item swap rows, shared by §6.13 and §6.15). Each card's "Add" and ☆ call deterministic direct-action endpoints, not the chat endpoint; a saved item's star fills (★) driven by a `savedKeys` set held in the panel. The chat input row also has a 📷 attach button that runs an uploaded image through `downscaleImage` (client-side canvas compression) before POSTing it to `/import-image` (§6.15). Owns the usuals + schedule state and renders `UsualsPanel` in the right column under the cart. The chat canvas is near viewport height and takes the wide grid column (2.2fr vs 1fr rail); while a request is in flight the typing dots carry a rotating status line (`THINKING_LINES`, advances ~2s, parks on the last line so it never loops like a hang).
 - **`CartSummary.jsx`** — reads the real, confirmed `get_cart` field names directly (`itemName`, `discountedFinalPrice`, `cartTotalAmount`, `imageUrl`, `spinId`, `skuId`), with defensive fallback key names kept in case a field is ever missing. Each line item renders a +/- quantity stepper (§6.8) that calls `/set-quantity` directly — a plain cart edit, not a chat action.
 - **`UsualsPanel.jsx`** — the editable "My Usuals" list (§6.11): saved items with remove ×, a "Reorder now" button, and the daily auto-add controls (enable toggle + `<input type="time">`). Renders the scheduler's last-run status (§6.12) as a warning or muted-confirmation line. All its actions are deterministic direct-action endpoints; the schedule toggle/time save optimistically and reconcile with the server's returned row. The whole panel is collapsible — its full header row is the toggle (chevron rotates, count badge stays visible collapsed) — open by default, so the list is one click away but doesn't permanently occupy the rail.
-- **`ProductThumb.jsx`** — a shared image tile (product cards + cart rows) that falls back to a clean placeholder rather than a broken-image icon when a photo is missing or fails to load, matching the same "never fake or drop it" policy Feast Finder's dish photos already used.
+- **`ProductThumb.jsx`** — a shared image tile (product cards + cart rows) that falls back to a clean placeholder rather than a broken-image icon when a photo is missing or fails to load, matching the same "never fake or drop it" policy Feaster's dish photos already used.
 
 ---
 
@@ -512,7 +512,7 @@ The token never leaves the backend (it's read from SQLite inside `getValidAccess
 |---|---|
 | `oauth_client` | DCR result — `client_id` (+ secret if any), the redirect URI it was registered with |
 | `oauth_token` | The single active access token + its expiry |
-| `saved_address` | The one delivery address both Feast Finder and Insta-nt use |
+| `saved_address` | The one delivery address both Feaster and Insta-nt use |
 | `order_history` | Append-only log of placed orders — only the food `/order` route logs to this table today; Instamart `checkout` is fully wired and callable from chat (gated by the system prompt's explicit-confirmation rule), it just isn't logged here yet |
 | `usuals` | The local, user-editable reorder list (§6.11) — one row per saved variant (`spin_id`/`sku_id` unique, so re-saving is an idempotent upsert). Autoincrement id, not a singleton, since it's a real list |
 | `usuals_schedule` | Singleton row for the daily auto-add (§6.12): `enabled`, `time` ("HH:MM"), and the scheduler's bookkeeping — `last_run_date` (gates once-per-day + is the priming marker), `last_status`/`last_status_at` (surfaced in the UI) |
@@ -544,7 +544,7 @@ The frontend's `api.js` mirrors the 401 case: any 401-shaped response becomes a 
 ┌───────────────────────────────────────────────────────────────────────────┐
 │  Browser (React)                                                          │
 │  ┌──────────────────┐              ┌──────────────────────────────────┐   │
-│  │  Feast Finder     │              │  Insta-nt                     │   │
+│  │  Feaster          │              │  Insta-nt                     │   │
 │  │  (DishCompare)    │              │  (InstamartChat + CartSummary)  │   │
 │  └────────┬──────────┘              └─────────────────┬────────────────┘  │
 └───────────┼─────────────────────────────────────────────┼────────────────┘

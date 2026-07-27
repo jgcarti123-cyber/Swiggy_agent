@@ -1486,7 +1486,7 @@ export async function reorderUsualsDirect({ addressId, displayText = "Reorder my
 // the model calling propose_ingredients (one completion, ends the loop); the
 // user then edits the checklist in the UI and hits Confirm, which lands here
 // with the FINAL ingredient list. Each ingredient is searched in parallel
-// (capped at 3 concurrent — same rate-limit reasoning as Feast Finder's
+// (capped at 3 concurrent — same rate-limit reasoning as Feaster's
 // scoped-menu fan-out), reusing the exact same pipeline as a normal guided
 // search: relevance filter (§6.10), go-to cross-reference (§6.9), stock/price
 // sort (§6.5). The best in-stock option per ingredient goes straight into the

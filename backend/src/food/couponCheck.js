@@ -22,7 +22,7 @@ export function checkBestCoupon(params) {
 
 async function checkBestCouponInner({ restaurantId, dish, menuItemId, addressId, restaurantName }) {
   // Snapshot whatever cart the user already has, so the throwaway probe cart
-  // below can be undone. Feast Finder now keeps a real, persistent food cart
+  // below can be undone. Feaster now keeps a real, persistent food cart
   // (the "Add to cart" feature) — an earlier version blindly flushed here,
   // which would silently wipe a cart the user had just built simply for
   // checking a coupon on another dish. Empty cart → nothing to restore.

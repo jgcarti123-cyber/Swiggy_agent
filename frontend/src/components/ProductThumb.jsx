@@ -2,7 +2,7 @@ import { useState } from "react";
 
 // Swiggy returns a photo for most, but not all, items. Render the real image
 // when we have one and it loads; otherwise a clean placeholder tile — never a
-// broken-image icon or a fake substitute (same policy as Feast Finder).
+// broken-image icon or a fake substitute (same policy as Feaster).
 export function ProductThumb({ src, alt, className = "" }) {
   const [failed, setFailed] = useState(false);
   const showImage = src && !failed;

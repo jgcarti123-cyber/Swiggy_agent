@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { api } from "../api.js";
 
-// Live food cart shown inside Feast Finder. A Swiggy food cart is
+// Live food cart shown inside Feaster. A Swiggy food cart is
 // single-restaurant, so the header names that one restaurant. The +/- stepper
 // and "Clear cart" push a fresh cart back up via onCartUpdate — plain cart
 // edits, no dish search involved.
