@@ -81,6 +81,17 @@ export const api = {
   instamartImportConfirm: (items) =>
     request("/api/instamart/import-confirm", { method: "POST", body: JSON.stringify({ items }) }),
 
+  // Per-item "Explain" popup: web-grounded Q&A about one product. `product`
+  // is the same card data already rendered (spinId, skuId, displayName,
+  // brand, quantityDescription, price); `history` is the running Q&A for
+  // this modal session so far ({role, content}[]), sent back each question
+  // so the model has context for follow-ups.
+  instamartExplainItem: (product, question, history) =>
+    request("/api/instamart/explain-item", {
+      method: "POST",
+      body: JSON.stringify({ ...product, question, history }),
+    }),
+
   // Usuals (local editable reorder list) + daily auto-add schedule.
   instamartUsuals: () => request("/api/instamart/usuals"),
   instamartSaveUsual: (product) =>

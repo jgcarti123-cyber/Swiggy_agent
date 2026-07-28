@@ -18,6 +18,17 @@ function PlusIcon() {
   );
 }
 
+// "Explain" button icon — a plain info glyph, matching the stroke/currentColor
+// style of every other icon in this file.
+function InfoIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 11v5M12 8h.01" />
+    </svg>
+  );
+}
+
 // Turn a /chat response into a renderable transcript message.
 function assistantMessageFromResult(result) {
   if (result.choice) {
@@ -27,7 +38,14 @@ function assistantMessageFromResult(result) {
     return { role: "assistant", type: "products", intro: result.products.intro, products: result.products.items || [] };
   }
   if (result.ingredients) {
-    return { role: "assistant", type: "ingredients", dish: result.ingredients.dish, ingredients: result.ingredients.ingredients || [] };
+    return {
+      role: "assistant",
+      type: "ingredients",
+      dish: result.ingredients.dish,
+      ingredients: result.ingredients.ingredients || [],
+      grounded: result.ingredients.grounded,
+      sourceUrls: result.ingredients.sourceUrls || [],
+    };
   }
   if (result.recipe) {
     return { role: "assistant", type: "recipe", dish: result.recipe.dish, reply: result.reply, groups: result.recipe.groups || [] };
@@ -548,6 +566,21 @@ function IngredientChecklist({ message, disabled, onConfirm }) {
         Here's what you'll need for <strong>{message.dish}</strong> — remove anything you have, add anything I missed,
         then confirm:
       </div>
+      {message.grounded && (
+        <p className="ingredient-grounded-note">
+          🔎 Based on real recipes from the web
+          {message.sourceUrls?.length > 0 && (
+            <>
+              {" — "}
+              {message.sourceUrls.map((u, i) => (
+                <a key={u} href={u} target="_blank" rel="noreferrer">
+                  [{i + 1}]
+                </a>
+              ))}
+            </>
+          )}
+        </p>
+      )}
       <div className={`ingredient-list${confirmed ? " ingredient-list--done" : ""}`}>
         <div className="ingredient-chips">
           {items.map((ing) => (
@@ -734,6 +767,7 @@ function RecipeMessage({ message, disabled, onSwap }) {
 }
 
 function ProductCard({ product: p, disabled, saved, onAdd, onToggleSave }) {
+  const [explainOpen, setExplainOpen] = useState(false);
   const hasDiscount = p.mrp != null && p.offerPrice != null && p.mrp > p.offerPrice;
   const outOfStock = p.inStock === false;
   return (
@@ -762,15 +796,137 @@ function ProductCard({ product: p, disabled, saved, onAdd, onToggleSave }) {
             ₹{p.offerPrice ?? p.mrp}
             {hasDiscount && <span className="product-card-mrp">₹{p.mrp}</span>}
           </span>
-          <button
-            type="button"
-            className="product-add-btn"
-            onClick={onAdd}
-            disabled={disabled || outOfStock}
-          >
-            {outOfStock ? "N/A" : "Add"}
+          <div className="product-card-buttons">
+            <button
+              type="button"
+              className="product-explain-btn"
+              onClick={() => setExplainOpen(true)}
+              aria-label={`Ask about ${p.displayName}`}
+              title="Ask about this item"
+            >
+              <InfoIcon />
+            </button>
+            <button
+              type="button"
+              className="product-add-btn"
+              onClick={onAdd}
+              disabled={disabled || outOfStock}
+            >
+              {outOfStock ? "N/A" : "Add"}
+            </button>
+          </div>
+        </div>
+      </div>
+      {explainOpen && <ExplainModal product={p} onClose={() => setExplainOpen(false)} />}
+    </div>
+  );
+}
+
+// Per-item "Explain" popup — a self-contained, web-grounded Q&A scoped to one
+// product. Deliberately separate from the main cart-building chat (its own
+// overlay, frontend-only state, no server-side transcript) so researching an
+// item never mixes into the ordering conversation. The first question
+// triggers a web search server-side (cached per spinId for the rest of the
+// backend process's life — see instamartAgent.js), so follow-up questions in
+// the same session are just a plain completion, no repeat search.
+function ExplainModal({ product, onClose }) {
+  const [history, setHistory] = useState([]); // [{role, content, grounded?, sourceUrls?}]
+  const [question, setQuestion] = useState("");
+  const [asking, setAsking] = useState(false);
+  const [error, setError] = useState(null);
+  const bottomRef = useRef(null);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [history, asking]);
+
+  async function ask(e) {
+    e.preventDefault();
+    const q = question.trim();
+    if (!q || asking) return;
+    setError(null);
+    const nextHistory = [...history, { role: "user", content: q }];
+    setHistory(nextHistory);
+    setQuestion("");
+    setAsking(true);
+    try {
+      const payload = {
+        spinId: product.spinId,
+        skuId: product.skuId,
+        displayName: product.displayName,
+        brand: product.brand,
+        quantityDescription: product.quantityDescription,
+        price: product.offerPrice ?? product.mrp ?? null,
+      };
+      const result = await api.instamartExplainItem(payload, q, history);
+      setHistory([
+        ...nextHistory,
+        { role: "assistant", content: result.answer, grounded: result.grounded, sourceUrls: result.sourceUrls || [] },
+      ]);
+    } catch (err) {
+      setError(err.message || "Couldn't get an answer");
+    } finally {
+      setAsking(false);
+    }
+  }
+
+  return (
+    <div
+      className="explain-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-label={`Ask about ${product.displayName}`}
+      onClick={onClose}
+    >
+      <div className="explain-card" onClick={(e) => e.stopPropagation()}>
+        <div className="explain-head">
+          <ProductThumb src={product.imageUrl} alt={product.displayName} className="explain-thumb" />
+          <div className="explain-head-info">
+            <p className="explain-title">{product.displayName}</p>
+            {product.quantityDescription && <p className="explain-qty">{product.quantityDescription}</p>}
+          </div>
+          <button type="button" className="explain-close" onClick={onClose} aria-label="Close">
+            ×
           </button>
         </div>
+
+        <div className="explain-thread">
+          {history.length === 0 && !asking && (
+            <p className="explain-empty">Ask anything about this item — ingredients, nutrition, how it compares, reviews…</p>
+          )}
+          {history.map((h, i) => (
+            <div key={i} className={`explain-msg explain-msg--${h.role}`}>
+              {h.content}
+              {h.role === "assistant" && h.sourceUrls?.length > 0 && (
+                <div className="explain-sources">
+                  Sources:{" "}
+                  {h.sourceUrls.map((u, j) => (
+                    <a key={u} href={u} target="_blank" rel="noreferrer">
+                      [{j + 1}]
+                    </a>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
+          {asking && <div className="explain-msg explain-msg--assistant explain-msg--pending">Thinking…</div>}
+          <div ref={bottomRef} />
+        </div>
+
+        {error && <p className="error-text">{error}</p>}
+
+        <form className="explain-input-row" onSubmit={ask}>
+          <input
+            value={question}
+            onChange={(e) => setQuestion(e.target.value)}
+            placeholder="e.g. is this good for weight loss?"
+            disabled={asking}
+            autoFocus
+          />
+          <button type="submit" disabled={asking || !question.trim()}>
+            {asking ? "Asking…" : "Ask"}
+          </button>
+        </form>
       </div>
     </div>
   );

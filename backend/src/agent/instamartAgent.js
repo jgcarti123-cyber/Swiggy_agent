@@ -3,6 +3,9 @@ import { runToolLoop } from "./toolLoop.js";
 import { NeedsReauthError } from "../auth/oauthClient.js";
 import { mapWithConcurrency } from "../utils/concurrency.js";
 import { extractItemsFromImage } from "./imageImport.js";
+import { searchWeb } from "./webSearch.js";
+import { createCompletionWithRetry } from "./groqClient.js";
+import { config } from "../config.js";
 import {
   listUsuals as dbListUsuals,
   addUsual as dbAddUsual,
@@ -204,6 +207,14 @@ const productBySku = new Map();
 // out-of-stock here even if Swiggy's search still claims otherwise, so the
 // user is never invited to retry a dead end. Reset only by a backend restart.
 const knownOutOfStockIds = new Set();
+
+// One web search per spinId, reused across every question asked about that
+// item in the "Explain" popup — searching fresh per question would be both
+// slower and unnecessary, since the underlying product doesn't change
+// mid-conversation. `null` is cached too (search failed/unavailable) so a
+// failed search isn't retried on every follow-up question either. Reset only
+// by a backend restart, same lifetime as the other item-keyed caches here.
+const itemSearchCache = new Map();
 
 function isKnownOutOfStock(spinId) {
   return spinId != null && knownOutOfStockIds.has(String(spinId));
@@ -1068,6 +1079,101 @@ function compactCartForModel(raw) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Recipe web-grounding — "search first, then generate" (see CLAUDE.md). The
+// model's first-pass propose_ingredients call (in makeExecuteTool below)
+// still recognizes the recipe intent and extracts the dish name from free
+// text exactly as before; what changes is that its OWN ingredient list is
+// now only a fallback. A real web search runs first, and a SECOND, narrowly
+// scoped completion re-derives the ingredient list grounded in that search
+// content. This is a genuine second Groq completion (this flow was "exactly
+// one completion" before) — an explicit, user-approved trade of a bit more
+// latency for a real recipe instead of pure model recall. Both the search
+// and the grounding completion fail open: any error, missing TAVILY_API_KEY,
+// or empty results silently falls back to the original ungrounded list, so
+// the recipe flow can never break because of this.
+// ---------------------------------------------------------------------------
+
+function dedupeIngredients(raw) {
+  const seen = new Set();
+  const out = [];
+  for (const item of Array.isArray(raw) ? raw : []) {
+    const ing = String(item || "").trim();
+    const key = ing.toLowerCase();
+    if (!ing || seen.has(key)) continue;
+    seen.add(key);
+    out.push(ing);
+    if (out.length >= 16) break; // "minimal" is the product requirement
+  }
+  return out;
+}
+
+const GROUND_INGREDIENTS_TOOL = {
+  type: "function",
+  function: {
+    name: "propose_ingredients",
+    description: "Report the final essential ingredient list, grounded in the real recipe content given.",
+    parameters: {
+      type: "object",
+      properties: {
+        ingredients: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Essential ingredients as short generic Instamart grocery search terms (no brands/quantities/steps), using Indian grocery names.",
+        },
+      },
+      required: ["ingredients"],
+    },
+  },
+};
+
+// Bounded, single-purpose completion (same pattern as discoveryAgent.js's
+// judgeRelevantItems/estimateNutrition) — not routed through runToolLoop
+// since there's no multi-turn tool use here, just one forced tool call.
+async function groundIngredients(dish, search) {
+  const sourceText = search.results
+    .slice(0, 3)
+    .map((r) => `Source: ${r.title || r.url || "unknown"}\n${r.content}`)
+    .join("\n\n");
+  const contextText = [search.answer ? `Summary: ${search.answer}` : null, sourceText]
+    .filter(Boolean)
+    .join("\n\n")
+    .slice(0, 6000); // keep the completion's input bounded regardless of how much Tavily returns
+  if (!contextText.trim()) return null;
+
+  try {
+    const completion = await createCompletionWithRetry({
+      model: config.groqModel,
+      reasoning_effort: "low",
+      messages: [
+        {
+          role: "system",
+          content: `You extract a real, essential ingredient list for "${dish}" from the recipe content given below — short generic Instamart grocery search terms, no brands, no quantities, no steps. Use the COMMON INDIAN GROCERY NAME for each staple: "curd" (not "yogurt"), "coriander leaves" (not "cilantro"), "capsicum" (not "bell pepper"), "paneer" (not "cottage cheese"), "chana"/"rajma" (not "garbanzo"/"kidney bean"), "green chilli" (not "jalapeño"). Ground your answer in the content given rather than general knowledge — if the content describes a specific recipe, follow it. Call propose_ingredients exactly once.`,
+        },
+        { role: "user", content: contextText },
+      ],
+      tools: [GROUND_INGREDIENTS_TOOL],
+      tool_choice: { type: "function", function: { name: "propose_ingredients" } },
+      max_tokens: 1024,
+    });
+
+    const choice = completion.choices[0];
+    if (choice.finish_reason !== "tool_calls") {
+      console.error(`[groundIngredients] non-terminal finish_reason="${choice.finish_reason}" for dish="${dish}"`);
+      return null;
+    }
+    const toolCall = choice.message.tool_calls?.[0];
+    if (!toolCall) return null;
+    const args = JSON.parse(toolCall.function.arguments || "{}");
+    const grounded = dedupeIngredients(args.ingredients);
+    return grounded.length > 0 ? grounded : null;
+  } catch (err) {
+    console.error(`[groundIngredients] failed for dish="${dish}": ${err.message}`);
+    return null;
+  }
+}
+
 // executeTool is built per-request as a closure over the resolved addressId,
 // which it injects into every tool call.
 function makeExecuteTool(addressId) {
@@ -1096,27 +1202,36 @@ function makeExecuteTool(addressId) {
       case "clear_cart":
         return instamartClient.clearCart();
       case "propose_ingredients": {
-        // The model's ONLY job here was generating the list — showing it for
-        // edit/confirm is a fixed outcome, so end the loop now (§6.4 pattern:
-        // no second completion to restate a decision already made). The
-        // Confirm click comes back through /recipe-confirm, a fully
-        // deterministic endpoint — the whole recipe flow costs exactly one
-        // Groq completion.
+        // The model's first-pass list is now only a FALLBACK — see the
+        // web-grounding block above. Showing the (possibly grounded) list for
+        // edit/confirm is still a fixed outcome, so this still ends the loop
+        // (§6.4 pattern) rather than paying for a completion to restate a
+        // decision already made. The Confirm click still comes back through
+        // /recipe-confirm, a fully deterministic endpoint.
         const dish = String(args.dish || "").trim() || "your dish";
-        const seen = new Set();
-        const ingredients = [];
-        for (const raw of Array.isArray(args.ingredients) ? args.ingredients : []) {
-          const ing = String(raw || "").trim();
-          const key = ing.toLowerCase();
-          if (!ing || seen.has(key)) continue;
-          seen.add(key);
-          ingredients.push(ing);
-          if (ingredients.length >= 16) break; // "minimal" is the product requirement
-        }
-        if (ingredients.length === 0) {
+        const fallback = dedupeIngredients(args.ingredients);
+        if (fallback.length === 0) {
           return { error: "ingredients array was empty — nothing to propose" };
         }
-        return { __endLoop: true, kind: "ingredients", payload: { dish, ingredients } };
+
+        let ingredients = fallback;
+        let grounded = false;
+        let sourceUrls = [];
+        try {
+          const search = await searchWeb({ query: `${dish} recipe ingredients` });
+          if (search && (search.results.length > 0 || search.answer)) {
+            const regrounded = await groundIngredients(dish, search);
+            if (regrounded) {
+              ingredients = regrounded;
+              grounded = true;
+              sourceUrls = search.results.slice(0, 3).map((r) => r.url).filter(Boolean);
+            }
+          }
+        } catch (err) {
+          console.error(`[propose_ingredients] web grounding failed for dish="${dish}": ${err.message}`);
+        }
+
+        return { __endLoop: true, kind: "ingredients", payload: { dish, ingredients, grounded, sourceUrls } };
       }
       case "get_usuals":
         return {
@@ -1194,10 +1309,10 @@ function buildFromBranch(kind, payload, text) {
     return { entry: { role: "assistant", text: fallback }, responsePayload: { reply: fallback } };
   }
   if (kind === "ingredients") {
-    const { dish, ingredients } = payload;
+    const { dish, ingredients, grounded, sourceUrls } = payload;
     return {
-      entry: { role: "assistant", type: "ingredients", dish, ingredients },
-      responsePayload: { reply: "", ingredients: { dish, ingredients } },
+      entry: { role: "assistant", type: "ingredients", dish, ingredients, grounded, sourceUrls },
+      responsePayload: { reply: "", ingredients: { dish, ingredients, grounded, sourceUrls } },
     };
   }
   if (kind === "empty") {
@@ -1927,6 +2042,74 @@ export async function setItemQuantity({ addressId, spinId, skuId, quantity }) {
     const cart = await instamartClient.getCartOrEmpty().catch(() => null);
     return { cart, error: friendlyCartError(err) };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Per-item "Explain" popup — web-grounded Q&A scoped to one product. Entirely
+// separate from the main cart-building chat (its own frontend-only modal, no
+// server-side transcript) — this function is stateless per call except for
+// the shared search cache above; the frontend resends the running Q&A
+// history each time so the model has context for follow-ups.
+// ---------------------------------------------------------------------------
+export async function explainItem({ spinId, skuId, displayName, brand, quantityDescription, price, question, history }) {
+  const q = String(question || "").trim();
+  if (!q) return { error: "question is required" };
+
+  const name = displayName || "this item";
+  const key = String(spinId || skuId || name);
+
+  let search = itemSearchCache.get(key);
+  if (search === undefined) {
+    const searchQuery = [name, brand].filter(Boolean).join(" ") + " ingredients nutrition review";
+    search = await searchWeb({ query: searchQuery }).catch(() => null);
+    itemSearchCache.set(key, search);
+  }
+
+  const productLine = [
+    `Product: ${name}`,
+    brand ? `Brand: ${brand}` : null,
+    quantityDescription ? `Size: ${quantityDescription}` : null,
+    price != null ? `Price: ₹${price}` : null,
+  ]
+    .filter(Boolean)
+    .join(" | ");
+
+  const webParts = [];
+  if (search?.answer) webParts.push(`Web summary: ${search.answer}`);
+  if (search?.results?.length) {
+    webParts.push(
+      search.results
+        .slice(0, 3)
+        .map((r) => `Source: ${r.title || r.url || "unknown"}\n${r.content}`)
+        .join("\n\n")
+    );
+  }
+  const webContext = webParts.join("\n\n").slice(0, 6000);
+
+  const messages = [
+    {
+      role: "system",
+      content: `You answer questions about a specific Instamart product for the user shopping in this app. Be concise (2-4 sentences unless the question genuinely needs more). Ground your answer in the product details and web content below — if they don't cover what's asked, say so honestly rather than inventing ingredients, nutrition facts, or claims.\n\n${productLine}\n\n${webContext || "No web content is available for this item."}`,
+    },
+    ...(Array.isArray(history) ? history : [])
+      .slice(-6)
+      .map((h) => ({ role: h?.role === "assistant" ? "assistant" : "user", content: String(h?.content || "") })),
+    { role: "user", content: q },
+  ];
+
+  const completion = await createCompletionWithRetry({
+    model: config.groqModel,
+    reasoning_effort: "low",
+    messages,
+    max_tokens: 512,
+  });
+
+  const answer = completion.choices[0]?.message?.content?.trim() || "I couldn't find an answer to that.";
+  return {
+    answer,
+    grounded: Boolean(search && (search.results?.length || search.answer)),
+    sourceUrls: (search?.results || []).slice(0, 3).map((r) => r.url).filter(Boolean),
+  };
 }
 
 export function resetConversation() {

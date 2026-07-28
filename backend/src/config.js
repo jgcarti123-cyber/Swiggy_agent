@@ -14,6 +14,9 @@ export const config = {
   // (confirmed in both the vision docs and the live models table). Overridable
   // since Groq's model list shifts and this one is a preview model.
   groqVisionModel: process.env.GROQ_VISION_MODEL || "meta-llama/llama-4-scout-17b-16e-instruct",
+  // Optional — see .env.example. Both the recipe-grounding and per-item
+  // "Explain" features degrade to their pre-web-search behavior when blank.
+  tavilyApiKey: process.env.TAVILY_API_KEY || "",
   swiggy: {
     authIssuer: "https://mcp.swiggy.com/auth",
     metadataUrl: "https://mcp.swiggy.com/.well-known/oauth-authorization-server",

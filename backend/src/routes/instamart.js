@@ -23,6 +23,7 @@ import {
   swapRecipeItemDirect,
   importImageDirect,
   confirmImportDirect,
+  explainItem,
 } from "../agent/instamartAgent.js";
 
 export const instamartRouter = Router();
@@ -187,6 +188,29 @@ instamartRouter.post("/import-confirm", async (req, res) => {
   const addressId = requireSavedAddress(res);
   if (!addressId) return;
   const result = await confirmImportDirect({ items, addressId });
+  res.json(result);
+});
+
+// Per-item "Explain" popup — web-grounded Q&A about one product. No delivery
+// address needed (this never touches the cart or Swiggy tools, just a web
+// search + a Groq completion), and works even without a Tavily key (falls
+// back to the model's own knowledge, clearly marked `grounded: false`).
+instamartRouter.post("/explain-item", async (req, res) => {
+  const { spinId, skuId, displayName, brand, quantityDescription, price, question, history } = req.body || {};
+  if (!question || !String(question).trim()) {
+    res.status(400).json({ error: "VALIDATION_ERROR", message: "question is required" });
+    return;
+  }
+  const result = await explainItem({
+    spinId,
+    skuId,
+    displayName,
+    brand,
+    quantityDescription,
+    price,
+    question,
+    history,
+  });
   res.json(result);
 });
 
