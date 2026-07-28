@@ -944,6 +944,22 @@ function keysInCart(cart) {
   return set;
 }
 
+// Returns { cart, targetItems } — targetItems is the EXACT merged item list
+// that was just written. Confirmed live: this is a real bug source, not just
+// a theoretical one. Every caller here used to "retry" a not-yet-landed item
+// by calling this function AGAIN, which re-reads the cart and re-merges
+// (existing quantity + requested quantity) from scratch. But the read right
+// after a write can race Swiggy's own eventual consistency — the write
+// genuinely succeeded, the verification read just hadn't caught up yet. When
+// that happened, the "retry" saw the (by-then-current) quantity as
+// "existing" and added the requested amount ON TOP of it a second time,
+// silently doubling real cart quantities with no error and no second click
+// from the user — reproduced live across a bulk "Reorder my usuals" batch,
+// where the same race can independently hit several items in one call.
+// Callers must NEVER re-derive a fresh merge for a retry; update_cart is
+// idempotent (replaying the identical item list is always safe — see
+// instamartClient.js), so a retry should resend this exact targetItems list
+// and re-verify, never recompute a new one from another read.
 async function mergeAndUpdateCart(addressId, newItems) {
   // The whole body is wrapped, not just updateCart: observed live, Swiggy's
   // get_cart itself can throw "Item quantity is partially available" (a
@@ -962,8 +978,10 @@ async function mergeAndUpdateCart(addressId, newItems) {
       const existing = merged.get(key);
       merged.set(key, { spinId: ni.spinId, skuId: ni.skuId, quantity: (existing?.quantity || 0) + (ni.quantity || 1) });
     }
-    await instamartClient.updateCart({ selectedAddressId: addressId, items: [...merged.values()] });
-    return instamartClient.getCartOrEmpty();
+    const targetItems = [...merged.values()];
+    await instamartClient.updateCart({ selectedAddressId: addressId, items: targetItems });
+    const cart = await instamartClient.getCartOrEmpty();
+    return { cart, targetItems };
   } catch (err) {
     // No point attempting a resync read when the failure is itself an
     // expired/missing token — it would just fail identically.
@@ -972,6 +990,13 @@ async function mergeAndUpdateCart(addressId, newItems) {
     }
     throw err;
   }
+}
+
+// Resend the exact item list from an earlier mergeAndUpdateCart call — never
+// recompute a new merge for a retry (see the comment above).
+async function resendCartTarget(addressId, targetItems) {
+  await instamartClient.updateCart({ selectedAddressId: addressId, items: targetItems });
+  return instamartClient.getCartOrEmpty();
 }
 
 // ---------------------------------------------------------------------------
@@ -1309,16 +1334,20 @@ export async function addItemDirect({ spinId, skuId, quantity = 1, addressId, di
 
   let becameOutOfStock = false;
   try {
-    cart = await mergeAndUpdateCart(addressId, [{ spinId, skuId, quantity }]);
+    const first = await mergeAndUpdateCart(addressId, [{ spinId, skuId, quantity }]);
+    cart = first.cart;
     let landed = keysInCart(cart).has(itemKey(spinId, skuId));
     if (!landed) {
       // Swiggy can report update_cart success while silently dropping this
       // specific item — confirmed live, reproducible for a given item/store
-      // combo, no error thrown to catch. One retry mirrors the "retry once"
-      // policy update_cart already gets for thrown failures
-      // (instamartClient.js's callWithRetry) — extending the same tolerance
-      // to a silent drop, which that layer has no way to see.
-      cart = await mergeAndUpdateCart(addressId, [{ spinId, skuId, quantity }]);
+      // combo, no error thrown to catch. But the retry here must RESEND the
+      // exact same target list already written above, not recompute a fresh
+      // merge (which would re-read the cart and add this item's quantity ON
+      // TOP of whatever's now there) — confirmed live that a stale
+      // just-after-write read is what actually caused this branch to fire
+      // most of the time, not a genuine drop, and recomputing on retry
+      // silently doubled the real quantity as a result.
+      cart = await resendCartTarget(addressId, first.targetItems);
       landed = keysInCart(cart).has(itemKey(spinId, skuId));
     }
     if (landed) {
@@ -1419,8 +1448,11 @@ export async function clearCartDirect({ addressId, displayText = "Clear my cart"
 async function addUsualsBestEffort(addressId, items) {
   let cart = null;
   let missing = items;
+  const targetByKey = new Map();
   try {
-    cart = await mergeAndUpdateCart(addressId, items);
+    const first = await mergeAndUpdateCart(addressId, items);
+    cart = first.cart;
+    for (const t of first.targetItems) targetByKey.set(itemKey(t.spinId, t.skuId), t);
     const present = keysInCart(cart);
     missing = items.filter((it) => !present.has(itemKey(it.spinId, it.skuId)));
   } catch (err) {
@@ -1432,23 +1464,34 @@ async function addUsualsBestEffort(addressId, items) {
     return { cart, added: items.length, failed: 0 };
   }
 
-  const current = (await instamartClient.getCartOrEmpty().catch(() => cart)) || { items: [] };
-  const merged = new Map();
-  for (const i of current.items || []) {
-    merged.set(itemKey(i.spinId, i.skuId), { spinId: i.spinId, skuId: i.skuId, quantity: i.quantity });
-  }
+  // Some items looked missing right after the batch write above — either a
+  // genuine per-item rejection, or (confirmed live, and the more common
+  // cause) a stale verification read that hadn't caught up to an
+  // already-successful write yet. Retry them ONE AT A TIME so a single
+  // genuinely-rejected item can't sink the rest (see ARCHITECTURE.md §6.11)
+  // — each retry re-reads the cart fresh (so an item that already landed
+  // from the batch write isn't accidentally dropped by update_cart's
+  // replace semantics) but always sets the retried item to its ALREADY-
+  // COMPUTED target quantity from the batch write above, never re-derived
+  // as "whatever's there now + more". That re-derivation is exactly what
+  // silently doubled real quantities before: an item that had actually
+  // already landed got a stale read that didn't show it yet, so the retry
+  // added its quantity a second time on top of the real, already-correct
+  // amount.
   for (const it of missing) {
     const key = itemKey(it.spinId, it.skuId);
-    const trial = new Map(merged);
-    const existing = trial.get(key);
-    trial.set(key, { spinId: it.spinId, skuId: it.skuId, quantity: (existing?.quantity || 0) + (it.quantity || 1) });
+    const target = targetByKey.get(key) || { spinId: it.spinId, skuId: it.skuId, quantity: it.quantity || 1 };
+    const base = await instamartClient.getCartOrEmpty().catch(() => ({ items: [] }));
+    const trial = new Map();
+    for (const i of base.items || []) {
+      trial.set(itemKey(i.spinId, i.skuId), { spinId: i.spinId, skuId: i.skuId, quantity: i.quantity });
+    }
+    trial.set(key, target);
     try {
       await instamartClient.updateCart({ selectedAddressId: addressId, items: [...trial.values()] });
-      merged.clear();
-      for (const [k, v] of trial) merged.set(k, v);
     } catch (e) {
       if (e instanceof NeedsReauthError) throw e;
-      // Leave `merged` as-is — this item stays out, counted as failed below.
+      // Genuinely didn't land — counted as failed below.
     }
   }
 
