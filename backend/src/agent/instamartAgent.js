@@ -934,13 +934,27 @@ function isItemUnavailableError(err) {
 // error thrown at all, so nothing downstream would notice without explicitly
 // checking. These two helpers let every add path verify the real cart state
 // instead of trusting "the call didn't throw" as proof an item landed.
-function itemKey(spinId, skuId) {
-  return `${spinId}:${skuId}`;
+//
+// Keyed by spinId ALONE, not spinId+skuId. Confirmed live this matters: the
+// same physical product's skuId isn't always stable — a "usual" saved at one
+// point (skuId A) and the identical product already sitting in the cart from
+// a different add (skuId B) are the same spinId but different skuId, and
+// Swiggy's own cart consolidates them into ONE line by spinId regardless.
+// Keying our own merge map by the spinId+skuId composite (the original
+// design) meant a skuId mismatch made this code treat the same physical item
+// as two "different" ones — merging in a second, separately-keyed entry
+// alongside the first instead of recognizing it as already present. Swiggy's
+// cart then silently combined those two entries into one line with a summed
+// quantity, which looked identical to (and was initially misdiagnosed as)
+// the retry-double-add bug fixed above, but has a different root cause and
+// needed this separate fix.
+function itemKey(spinId) {
+  return String(spinId);
 }
 
 function keysInCart(cart) {
   const set = new Set();
-  for (const i of cart?.items || []) set.add(itemKey(i.spinId, i.skuId));
+  for (const i of cart?.items || []) set.add(itemKey(i.spinId));
   return set;
 }
 
@@ -971,12 +985,20 @@ async function mergeAndUpdateCart(addressId, newItems) {
     const current = await instamartClient.getCartOrEmpty();
     const merged = new Map();
     for (const i of current.items || []) {
-      merged.set(`${i.spinId}:${i.skuId}`, { spinId: i.spinId, skuId: i.skuId, quantity: i.quantity });
+      merged.set(itemKey(i.spinId), { spinId: i.spinId, skuId: i.skuId, quantity: i.quantity });
     }
     for (const ni of newItems) {
-      const key = `${ni.spinId}:${ni.skuId}`;
+      const key = itemKey(ni.spinId);
       const existing = merged.get(key);
-      merged.set(key, { spinId: ni.spinId, skuId: ni.skuId, quantity: (existing?.quantity || 0) + (ni.quantity || 1) });
+      // Keyed by spinId only (see itemKey) — and prefer whichever skuId is
+      // ALREADY settled in the live cart for this spinId, rather than the
+      // new item's own skuId, so a re-add never introduces a second,
+      // divergent skuId reference for a product already sitting in the cart.
+      merged.set(key, {
+        spinId: ni.spinId,
+        skuId: existing?.skuId ?? ni.skuId,
+        quantity: (existing?.quantity || 0) + (ni.quantity || 1),
+      });
     }
     const targetItems = [...merged.values()];
     await instamartClient.updateCart({ selectedAddressId: addressId, items: targetItems });
