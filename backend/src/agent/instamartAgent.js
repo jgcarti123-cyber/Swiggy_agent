@@ -887,6 +887,19 @@ function friendlyCartError(err) {
   if (/partially available/i.test(first)) {
     return `the cart may be stuck — tap "Clear cart" below to reset it, then try again.`;
   }
+  // Confirmed live: this is a cart-WIDE per-item quantity cap, not something
+  // about the specific item just clicked — and it poisons get_cart the same
+  // way "partially available" does (every read fails identically, not just
+  // adds). Swiggy's raw text never names which item hit the cap, so there's
+  // no way to fix just that one from the client side; the honest advice is
+  // to reduce quantities or clear the cart, not "pick something else." Its
+  // raw wording also reads like it's addressing an AI agent directly
+  // ("Display the cart to the user...", "Do NOT proceed to checkout...") —
+  // confirmed this is Swiggy's own live server text, not anything this app
+  // added, but it's never shown to the user verbatim regardless of that.
+  if (/quantity limit reached/i.test(first)) {
+    return "you've hit Swiggy's order-quantity limit on one of your items — open the cart, reduce it, or clear the cart to start over.";
+  }
   if (/out of stock|none of the requested items are (?:currently )?in stock/i.test(first)) {
     return "it's out of stock right now — try another option.";
   }
@@ -897,14 +910,14 @@ function friendlyCartError(err) {
 }
 
 // Whether a thrown error means THIS item specifically can't be added — as
-// opposed to a cart-level problem (a stuck/"partially available" cart) that
-// isn't this item's fault and could equally block a totally different item.
-// Used to decide whether to call markSpinOutOfStock: only a real, item-
-// attributable rejection should permanently hide a product for the rest of
-// the session.
+// opposed to a cart-level problem (a stuck/"partially available" cart, or a
+// cart-wide quantity cap) that isn't this item's fault and could equally
+// block a totally different item. Used to decide whether to call
+// markSpinOutOfStock: only a real, item-attributable rejection should
+// permanently hide a product for the rest of the session.
 function isItemUnavailableError(err) {
   const first = String(err.message || "").split("\n")[0].trim();
-  if (/partially available/i.test(first)) return false;
+  if (/partially available|quantity limit reached/i.test(first)) return false;
   return /out of stock|none of the requested items are (?:currently )?in stock|no valid items|not serviceable|cannot be added|couldn'?t be added|an error occurred|unavailable/i.test(
     first
   );
