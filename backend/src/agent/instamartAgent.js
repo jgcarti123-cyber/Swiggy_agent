@@ -1094,11 +1094,57 @@ function compactCartForModel(raw) {
 // the recipe flow can never break because of this.
 // ---------------------------------------------------------------------------
 
+// US-English → Indian grocery terms, applied DETERMINISTICALLY rather than
+// trusting a system-prompt instruction to do it.
+//
+// This exists because web grounding regressed a rule the app already had.
+// The ungrounded `propose_ingredients` prompt has said "use the common Indian
+// grocery name" (curd not yogurt, coriander leaves not cilantro, …) since the
+// recipe flow shipped — but grounding feeds the model real recipe pages,
+// which are overwhelmingly US-English, and the model follows the source
+// wording it was just handed. Confirmed live and reported by the user: a
+// grounded list produced "plain yogurt", and searching Instamart for that
+// returns sweetened, FLAVOURED Greek tubs (Epigamia Raspberry/Mango/
+// Blueberry) — an actual wrong item auto-added to the cart — while "curd"
+// returns plain dahi (Amul Masti Dahi, Milky Mist Set Curd), which is what an
+// Indian recipe means. Verified both searches side by side against the live
+// catalogue before writing this map.
+//
+// Deliberately conservative: only terms with ONE unambiguous Indian
+// equivalent. Bare "coriander" is intentionally absent — it can mean the
+// powder (dhania) or the fresh leaves, so rewriting it would guess.
+const INDIAN_TERM_RULES = [
+  { test: /\byogh?urt\b/i, to: "curd" },
+  { test: /\bcilantro\b/i, to: "coriander leaves" },
+  { test: /\bbell peppers?\b/i, to: "capsicum" },
+  { test: /\bcottage cheese\b/i, to: "paneer" },
+  { test: /\bgarbanzos?( beans?)?\b|\bchick ?peas?\b/i, to: "chana" },
+  { test: /\bkidney beans?\b/i, to: "rajma" },
+  { test: /\bjalape(?:n|ñ)os?\b|\bserranos?\b/i, to: "green chilli" },
+  { test: /\bscallions?\b|\bgreen onions?\b/i, to: "spring onion" },
+  { test: /\ball[- ]purpose flour\b|\bplain flour\b/i, to: "maida" },
+  { test: /\bclarified butter\b/i, to: "ghee" },
+  { test: /\beggplants?\b|\baubergines?\b/i, to: "brinjal" },
+  { test: /\bokra\b/i, to: "lady finger" },
+  { test: /\bcorn ?starch\b/i, to: "corn flour" },
+];
+
+function toIndianGroceryTerm(ingredient) {
+  for (const rule of INDIAN_TERM_RULES) {
+    if (rule.test.test(ingredient)) return rule.to;
+  }
+  return ingredient;
+}
+
+// Normalization runs BEFORE dedupe on purpose: a grounded list can legitimately
+// contain both "curd" and "plain yogurt" (the same thing, named twice from
+// different sources), and normalizing first collapses them into one entry
+// instead of searching for — and adding — the same ingredient twice.
 function dedupeIngredients(raw) {
   const seen = new Set();
   const out = [];
   for (const item of Array.isArray(raw) ? raw : []) {
-    const ing = String(item || "").trim();
+    const ing = toIndianGroceryTerm(String(item || "").trim());
     const key = ing.toLowerCase();
     if (!ing || seen.has(key)) continue;
     seen.add(key);

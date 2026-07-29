@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { api } from "../api.js";
 import { AddressPicker } from "./AddressPicker.jsx";
 import { CartSummary } from "./CartSummary.jsx";
@@ -829,6 +830,10 @@ function ProductCard({ product: p, disabled, saved, onAdd, onToggleSave }) {
 // triggers a web search server-side (cached per spinId for the rest of the
 // backend process's life — see instamartAgent.js), so follow-up questions in
 // the same session are just a plain completion, no repeat search.
+// Starter prompts for the empty state — one tap instead of typing. Kept
+// generic enough to make sense for any product (food, personal care, etc).
+const EXPLAIN_SUGGESTIONS = ["What's in it?", "Is it healthy?", "How do I use it?", "Any downsides?"];
+
 function ExplainModal({ product, onClose }) {
   const [history, setHistory] = useState([]); // [{role, content, grounded?, sourceUrls?}]
   const [question, setQuestion] = useState("");
@@ -837,12 +842,26 @@ function ExplainModal({ product, onClose }) {
   const bottomRef = useRef(null);
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }, [history, asking]);
 
-  async function ask(e) {
-    e.preventDefault();
-    const q = question.trim();
+  // Escape closes, and the page behind is scroll-locked while the dialog is
+  // up — both standard modal behavior that was missing.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onKey);
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.body.style.overflow = prevOverflow;
+    };
+  }, [onClose]);
+
+  async function submitQuestion(raw) {
+    const q = String(raw || "").trim();
     if (!q || asking) return;
     setError(null);
     const nextHistory = [...history, { role: "user", content: q }];
@@ -870,7 +889,17 @@ function ExplainModal({ product, onClose }) {
     }
   }
 
-  return (
+  const price = product.offerPrice ?? product.mrp;
+
+  // Portalled to <body> ON PURPOSE, not rendered in place: `.product-card`
+  // sets `overflow: hidden` and a `transform` on :hover, and a transform
+  // makes that card the containing block for any `position: fixed`
+  // descendant — which trapped this overlay inside the ~200px card and
+  // clipped it (confirmed live: the dialog rendered as a squeezed column of
+  // one-word-per-line text inside the grid cell). A portal takes it out of
+  // the card's subtree entirely, so `position: fixed` resolves against the
+  // viewport as intended.
+  return createPortal(
     <div
       className="explain-overlay"
       role="dialog"
@@ -883,7 +912,11 @@ function ExplainModal({ product, onClose }) {
           <ProductThumb src={product.imageUrl} alt={product.displayName} className="explain-thumb" />
           <div className="explain-head-info">
             <p className="explain-title">{product.displayName}</p>
-            {product.quantityDescription && <p className="explain-qty">{product.quantityDescription}</p>}
+            <p className="explain-sub">
+              {product.quantityDescription}
+              {product.quantityDescription && price != null ? " · " : ""}
+              {price != null && <span className="explain-price">₹{price}</span>}
+            </p>
           </div>
           <button type="button" className="explain-close" onClick={onClose} aria-label="Close">
             ×
@@ -892,42 +925,65 @@ function ExplainModal({ product, onClose }) {
 
         <div className="explain-thread">
           {history.length === 0 && !asking && (
-            <p className="explain-empty">Ask anything about this item — ingredients, nutrition, how it compares, reviews…</p>
+            <div className="explain-empty">
+              <p className="explain-empty-title">Ask anything about this item</p>
+              <p className="explain-empty-sub">Ingredients, nutrition, how it compares, reviews…</p>
+              <div className="explain-suggestions">
+                {EXPLAIN_SUGGESTIONS.map((s) => (
+                  <button key={s} type="button" className="explain-suggestion" onClick={() => submitQuestion(s)}>
+                    {s}
+                  </button>
+                ))}
+              </div>
+            </div>
           )}
           {history.map((h, i) => (
             <div key={i} className={`explain-msg explain-msg--${h.role}`}>
-              {h.content}
+              <span className="explain-msg-text">{h.content}</span>
               {h.role === "assistant" && h.sourceUrls?.length > 0 && (
-                <div className="explain-sources">
+                <span className="explain-sources">
                   Sources:{" "}
                   {h.sourceUrls.map((u, j) => (
                     <a key={u} href={u} target="_blank" rel="noreferrer">
                       [{j + 1}]
                     </a>
                   ))}
-                </div>
+                </span>
               )}
             </div>
           ))}
-          {asking && <div className="explain-msg explain-msg--assistant explain-msg--pending">Thinking…</div>}
+          {asking && (
+            <div className="explain-msg explain-msg--assistant explain-msg--pending">
+              <span className="explain-dot" />
+              <span className="explain-dot" />
+              <span className="explain-dot" />
+            </div>
+          )}
           <div ref={bottomRef} />
         </div>
 
-        {error && <p className="error-text">{error}</p>}
+        {error && <p className="explain-error">{error}</p>}
 
-        <form className="explain-input-row" onSubmit={ask}>
+        <form
+          className="explain-input-row"
+          onSubmit={(e) => {
+            e.preventDefault();
+            submitQuestion(question);
+          }}
+        >
           <input
             value={question}
             onChange={(e) => setQuestion(e.target.value)}
-            placeholder="e.g. is this good for weight loss?"
+            placeholder="Ask about this item…"
             disabled={asking}
             autoFocus
           />
           <button type="submit" disabled={asking || !question.trim()}>
-            {asking ? "Asking…" : "Ask"}
+            {asking ? "…" : "Ask"}
           </button>
         </form>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }
