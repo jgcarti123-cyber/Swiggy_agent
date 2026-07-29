@@ -208,18 +208,24 @@ const productBySku = new Map();
 // user is never invited to retry a dead end. Reset only by a backend restart.
 const knownOutOfStockIds = new Set();
 
-// One web search per (item, exact question) pair in the "Explain" popup.
-// Originally this cached ONE generic search per item and reused it for every
-// question — cheaper, but confirmed live as a real quality bug: asking
-// "does this have caffeine in it?" about Coca-Cola Zero got refused, because
-// the one generic "product review ingredients nutrition" search never
-// happened to mention caffeine, and the model was told to only use what it
-// was given. A question-specific search (product + the actual question)
-// finds the actually-relevant content instead. `null` is cached too (search
-// failed/unavailable) so a failed search isn't retried on an identical
-// re-ask. Reset only by a backend restart, same lifetime as the other
-// item-keyed caches here.
-const itemSearchCache = new Map();
+// Accumulated web knowledge per item for the "Explain" popup — NOT one
+// search reused, and not per-question searches thrown away after answering.
+// Both of those earlier designs produced user-reported inconsistency:
+//   1. One generic search per item: "does this have caffeine?" (Coca-Cola
+//      Zero) was refused because that single generic search never mentioned
+//      caffeine.
+//   2. Per-question searches, each discarded afterwards: a fact surfaced
+//      while answering one question was invisible to the next, so the popup
+//      could refuse ("I don't have the sugar content") and then state that
+//      very fact two answers later — exactly the discrepancy reported.
+// So content is POOLED per item and only ever grows within a session: every
+// answer sees everything gathered so far, which makes "it knew that a moment
+// ago" impossible. Keyed by item; `queries` dedupes so the same search is
+// never paid for twice. Reset only by a backend restart, same lifetime as the
+// other item-keyed caches here.
+const itemKnowledge = new Map();
+const EXPLAIN_POOL_MAX_RESULTS = 24;
+const EXPLAIN_CONTEXT_CHARS = 7000;
 
 function isKnownOutOfStock(spinId) {
   return spinId != null && knownOutOfStockIds.has(String(spinId));
@@ -2119,29 +2125,163 @@ const EXPLAIN_ANSWER_TOOL = {
   },
 };
 
+// Search-engine stopwords — a question typed at a chat box ("does this have
+// sugar content/") makes a poor search query verbatim: the filler words
+// dilute it and stray punctuation leaks in. Stripping to the content words
+// ("sugar content") is what actually retrieves the nutrition panel.
+const EXPLAIN_STOPWORDS = new Set([
+  "a", "an", "the", "is", "are", "was", "were", "be", "been", "am", "do", "does", "did", "have",
+  "has", "had", "can", "could", "should", "would", "will", "shall", "may", "might", "must",
+  "this", "that", "these", "those", "it", "its", "i", "me", "my", "you", "your", "we", "us",
+  "what", "which", "who", "whom", "how", "why", "when", "where", "much", "many", "any", "some",
+  "in", "on", "at", "of", "for", "to", "from", "with", "about", "and", "or", "but", "if", "so",
+  "there", "here", "get", "got", "tell", "know", "want", "need", "please", "thanks",
+]);
+
+function explainSearchTerms(question) {
+  const words = String(question || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s%.-]/g, " ") // drop stray punctuation like the trailing "/"
+    .split(/\s+/)
+    .filter((w) => w && !EXPLAIN_STOPWORDS.has(w));
+  // If a question is nothing but stopwords ("is it?"), fall back to the raw
+  // text rather than searching for an empty string.
+  return words.length > 0 ? words.join(" ") : String(question || "").trim();
+}
+
+// Does this retrieved text actually talk about THIS product?
+//
+// Load-bearing, and prompt instructions alone were verified NOT to be enough:
+// asked "how much sodium?" about a deliberately fictional product, Tavily
+// returned three pages about unrelated snacks AND a synthesized `answer`
+// summary asserting "Zzyqx Blorptastic Nutrient Cube 4400 contains 200 mg of
+// sodium per serving... part of the Zee Zees brand" — a number lifted off an
+// unrelated Zee Zees nutrition page. The model repeated that as fact 3/3
+// times even after being explicitly warned in the system prompt that sources
+// may describe other products. So the guard has to be deterministic, in code,
+// the same way filterRelevantProducts (§6.10) handles Swiggy's own fuzzy
+// search rather than paying a model call to judge relevance.
+//
+// Deliberately STRICT — brand identity is the strongest signal, and the
+// failure modes are asymmetric: a false negative just means this source isn't
+// used (the answer falls back to general knowledge or an honest "I don't
+// know"), while a false positive means fabricating a specific figure for the
+// wrong product, which is the thing that must never happen.
+function explainNormalize(s) {
+  return String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function explainMentionsProduct(text, name, brand) {
+  const hay = explainNormalize(text);
+  if (!hay) return false;
+
+  const brandKey = explainNormalize(brand);
+  if (brandKey.length >= 3) {
+    if (hay.includes(brandKey)) return true;
+    // Multi-word brands can be punctuated differently on the page
+    // ("Dr. Sheth's" vs "Dr Sheth"), so also accept every brand word
+    // appearing somewhere in the text.
+    const words = String(brand).toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length >= 3);
+    if (words.length > 1 && words.every((w) => hay.includes(w))) return true;
+    return false;
+  }
+
+  // No usable brand — fall back to distinctive words from the product name.
+  const nameWords = [...new Set(String(name).toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length >= 5))];
+  const hits = nameWords.filter((w) => hay.includes(w)).length;
+  return hits >= 2;
+}
+
+function explainPoolFor(itemKey) {
+  let pool = itemKnowledge.get(itemKey);
+  if (!pool) {
+    pool = { results: new Map(), summaries: [], queries: new Set() };
+    itemKnowledge.set(itemKey, pool);
+  }
+  return pool;
+}
+
+// Runs one search and folds whatever it finds into the item's pool. Returns
+// the results that were NEW this call, so the caller can cite the sources
+// that actually informed this particular answer first. Never throws and never
+// repeats an identical query for the same item.
+async function explainGather(pool, query, name, brand) {
+  const norm = String(query || "").trim().toLowerCase();
+  if (!norm || pool.queries.has(norm)) return [];
+  pool.queries.add(norm);
+
+  const res = await searchWeb({ query }).catch(() => null);
+  if (!res) return [];
+
+  // Keep only sources that genuinely discuss this product.
+  const relevant = (res.results || []).filter(
+    (r) => r?.content && explainMentionsProduct(`${r.title || ""} ${r.content}`, name, brand)
+  );
+
+  // Tavily's synthesized `answer` is accepted ONLY if at least one real source
+  // page survived that filter. Running explainMentionsProduct on the summary
+  // itself is useless — the summary echoes the query's own wording back, so it
+  // always "mentions" the product even when it's pure hallucination (verified:
+  // for a fictional product it asserted "Zzyqx Blorptastic Nutrient Cube 4400
+  // contains 200 mg of sodium" while not one underlying page mentioned Zzyqx).
+  // Since the summary is synthesized FROM those pages, if none of them are
+  // about this product then neither is the summary.
+  const summary = res.answer?.trim();
+  if (summary && relevant.length > 0 && !pool.summaries.includes(summary)) {
+    pool.summaries.push(summary);
+  }
+
+  const fresh = [];
+  for (const r of relevant) {
+    const key = r.url || r.title || r.content.slice(0, 80);
+    if (pool.results.has(key)) continue;
+    if (pool.results.size >= EXPLAIN_POOL_MAX_RESULTS) break;
+    pool.results.set(key, r);
+    fresh.push(r);
+  }
+  return fresh;
+}
+
+// Builds the model's context from EVERYTHING pooled for this item, with the
+// current question's own fresh hits first so the most on-point material leads.
+function explainContext(pool, fresh) {
+  const freshKeys = new Set(fresh.map((r) => r.url || r.title || r.content.slice(0, 80)));
+  const rest = [...pool.results.values()].filter(
+    (r) => !freshKeys.has(r.url || r.title || r.content.slice(0, 80))
+  );
+
+  const parts = [];
+  if (pool.summaries.length > 0) parts.push(`Web summaries:\n- ${pool.summaries.join("\n- ")}`);
+  for (const r of [...fresh, ...rest]) {
+    parts.push(`Source: ${r.title || r.url || "unknown"}\n${r.content}`);
+  }
+  return parts.join("\n\n").slice(0, EXPLAIN_CONTEXT_CHARS);
+}
+
 // ---------------------------------------------------------------------------
 // Per-item "Explain" popup — web-grounded Q&A scoped to one product. Entirely
 // separate from the main cart-building chat (its own frontend-only modal, no
-// server-side transcript) — this function is stateless per call except for
-// the shared search cache above; the frontend resends the running Q&A
-// history each time so the model has context for follow-ups.
+// server-side transcript). The frontend resends the running Q&A history each
+// time; retrieved web content lives in the per-item pool above, so an answer
+// can always see everything found for earlier questions about the same item.
 // ---------------------------------------------------------------------------
 export async function explainItem({ spinId, skuId, displayName, brand, quantityDescription, price, question, history }) {
   const q = String(question || "").trim();
   if (!q) return { error: "question is required" };
 
   const name = displayName || "this item";
-  const cacheKey = `${spinId || skuId || name}::${q.toLowerCase()}`;
+  const itemKey = String(spinId || skuId || name);
+  const pool = explainPoolFor(itemKey);
+  const label = [name, brand].filter(Boolean).join(" ");
 
-  // Searched per QUESTION, not once per item — see itemSearchCache's comment
-  // for why. Combining the product identity with the actual question is what
-  // makes the retrieved content relevant to what's actually being asked.
-  let search = itemSearchCache.get(cacheKey);
-  if (search === undefined) {
-    const searchQuery = `${[name, brand].filter(Boolean).join(" ")} ${q}`.trim();
-    search = await searchWeb({ query: searchQuery }).catch(() => null);
-    itemSearchCache.set(cacheKey, search);
-  }
+  // Baseline specs search, once per item: guarantees the core factual panel
+  // (nutrition/ingredients/spec) is in the pool no matter how any individual
+  // question happens to be worded — the single biggest cause of the reported
+  // "it refused, then knew it later" inconsistency on food items.
+  const baselineFresh = await explainGather(pool, `${label} nutrition facts ingredients specifications`, name, brand);
+  // Then this question's own targeted search, on cleaned terms.
+  const questionFresh = await explainGather(pool, `${label} ${explainSearchTerms(q)}`, name, brand);
+  let fresh = [...questionFresh, ...baselineFresh];
 
   const productLine = [
     `Product: ${name}`,
@@ -2152,18 +2292,6 @@ export async function explainItem({ spinId, skuId, displayName, brand, quantityD
     .filter(Boolean)
     .join(" | ");
 
-  const webParts = [];
-  if (search?.answer) webParts.push(`Web summary: ${search.answer}`);
-  if (search?.results?.length) {
-    webParts.push(
-      search.results
-        .slice(0, 3)
-        .map((r) => `Source: ${r.title || r.url || "unknown"}\n${r.content}`)
-        .join("\n\n")
-    );
-  }
-  const webContext = webParts.join("\n\n").slice(0, 6000);
-
   // Confirmed live this priority order matters: an earlier version told the
   // model to ONLY use the given content and refuse otherwise, which made it
   // refuse "does Coca-Cola Zero have caffeine?" — a well-known fact — purely
@@ -2173,66 +2301,134 @@ export async function explainItem({ spinId, skuId, displayName, brand, quantityD
   // then genuine general knowledge (never refuse a well-known fact for lack
   // of a citation), and only admit defeat when neither actually covers it —
   // with `basis` reported honestly so the UI can show which one happened.
-  const messages = [
-    {
-      role: "system",
-      content: `You answer questions about a specific Instamart product for the user shopping in this app.
+  const askModel = async () => {
+    const webContext = explainContext(pool, fresh);
+    const messages = [
+      {
+        role: "system",
+        content: `You answer questions about a specific Instamart product for the user shopping in this app.
+
+CRITICAL — the web content below came from a search engine and is NOT guaranteed to be about this exact product. Some sources will describe a DIFFERENT product, brand, or variant. Before using any figure or claim from it, check that the source clearly refers to THIS product (the brand and product name match). If the content is only about other products, treat the question as NOT covered by the web content — never borrow another product's numbers and present them as this one's. Inventing or transplanting a specific figure is far worse than saying you don't know.
 
 Answer using this priority order:
-1. If the web content below substantively covers the question, base your answer on it — it's specific to this exact product and the most reliable source.
+1. If the web content below substantively covers the question AND clearly refers to this product, base your answer on it — it's the most reliable source. Read ALL of it before deciding you don't have the answer: it is pooled from several searches about this product, so the relevant figure is often further down, not in the first source. Prefer exact figures ("2 g of sugar per 50 g bar") over vague ones when they're present.
 2. If it doesn't cover the question but the answer is well-established general knowledge (e.g. "Coca-Cola Zero contains caffeine" is true of the whole product line, not an obscure or product-specific detail), answer from your own knowledge rather than refusing. Do not refuse a well-known fact just because the search snippet didn't happen to mention it.
 3. Only say you don't have a reliable answer when NEITHER the web content nor your own general knowledge covers it with confidence — never invent a specific number, ingredient, or claim you're not sure of.
+
+Be consistent: if an earlier answer in this conversation already stated a fact, do not contradict it or claim not to know it now.
 
 Set "basis" honestly to whichever of the above you actually used. Call answer_question exactly once.
 
 ${productLine}
 
 ${webContext || "No web content was found for this question."}`,
-    },
-    ...(Array.isArray(history) ? history : [])
-      .slice(-6)
-      .map((h) => ({ role: h?.role === "assistant" ? "assistant" : "user", content: String(h?.content || "") })),
-    { role: "user", content: q },
-  ];
+      },
+      ...(Array.isArray(history) ? history : [])
+        .slice(-6)
+        .map((h) => ({ role: h?.role === "assistant" ? "assistant" : "user", content: String(h?.content || "") })),
+      { role: "user", content: q },
+    ];
 
-  const completion = await createCompletionWithRetry({
-    model: config.groqModel,
-    reasoning_effort: "low",
-    messages,
-    tools: [EXPLAIN_ANSWER_TOOL],
-    tool_choice: { type: "function", function: { name: "answer_question" } },
-    max_tokens: 512,
-  });
-
-  const choice = completion.choices[0];
-  let answer = "I couldn't find an answer to that.";
-  let basis = "insufficient_info";
-  if (choice.finish_reason === "tool_calls" && choice.message.tool_calls?.[0]) {
-    try {
-      const args = JSON.parse(choice.message.tool_calls[0].function.arguments || "{}");
+    let answer = "I couldn't find an answer to that.";
+    let basis = "insufficient_info";
+    const takeArgs = (raw) => {
+      const args = JSON.parse(raw || "{}");
       if (args.answer) answer = String(args.answer).trim();
       if (args.basis === "search" || args.basis === "general_knowledge" || args.basis === "insufficient_info") {
         basis = args.basis;
       }
+    };
+
+    let completion = null;
+    try {
+      completion = await createCompletionWithRetry({
+        model: config.groqModel,
+        reasoning_effort: "low",
+        messages,
+        tools: [EXPLAIN_ANSWER_TOOL],
+        tool_choice: { type: "function", function: { name: "answer_question" } },
+        max_tokens: 512,
+      });
     } catch (err) {
-      console.error(`[explainItem] failed to parse tool call for "${q}": ${err.message}`);
+      // Groq intermittently 400s a FORCED tool call with
+      // "Tool choice is required, but model did not call a tool"
+      // (failed_generation empty) — observed on ~2 of 4 consecutive real
+      // questions, so this is common enough to break the feature outright:
+      // it surfaced to the user as a 500. Fall back to JSON mode, which asks
+      // for the same {answer, basis} shape without depending on tool calling
+      // (the same response_format the vision extractor already relies on).
+      if (!/tool_use_failed|did not call a tool/i.test(String(err?.message))) throw err;
+      console.error(`[explainItem] forced tool call failed for "${q}", falling back to JSON mode`);
+      const fallback = await createCompletionWithRetry({
+        model: config.groqModel,
+        reasoning_effort: "low",
+        messages: [
+          ...messages,
+          {
+            role: "system",
+            content:
+              'Reply with ONLY a JSON object, no prose: {"answer": "<your answer>", "basis": "search" | "general_knowledge" | "insufficient_info"}',
+          },
+        ],
+        response_format: { type: "json_object" },
+        max_tokens: 512,
+      });
+      try {
+        takeArgs(fallback.choices[0]?.message?.content);
+      } catch (parseErr) {
+        console.error(`[explainItem] JSON-mode fallback unparseable for "${q}": ${parseErr.message}`);
+        const text = fallback.choices[0]?.message?.content?.trim();
+        if (text) answer = text;
+      }
+      return { answer, basis };
     }
-  } else if (choice.message?.content) {
-    // Model answered in plain text instead of calling the tool (shouldn't
-    // happen with tool_choice forced, but don't discard a real answer over it).
-    answer = choice.message.content.trim();
+
+    const choice = completion.choices[0];
+    if (choice.finish_reason === "tool_calls" && choice.message.tool_calls?.[0]) {
+      try {
+        takeArgs(choice.message.tool_calls[0].function.arguments);
+      } catch (err) {
+        console.error(`[explainItem] failed to parse tool call for "${q}": ${err.message}`);
+      }
+    } else if (choice.message?.content) {
+      // Model answered in plain text instead of calling the tool (shouldn't
+      // happen with tool_choice forced, but don't discard a real answer over it).
+      answer = choice.message.content.trim();
+    }
+    return { answer, basis };
+  };
+
+  let { answer, basis } = await askModel();
+
+  // One broader retry before actually refusing. A question phrased for a chat
+  // box can search badly even after stopword cleaning, and a bare "I don't
+  // have that" is exactly the failure the user reported — so spend one more
+  // search (only on the path that was going to fail anyway) before giving up.
+  if (basis === "insufficient_info") {
+    const retryFresh = await explainGather(pool, `${name} ${explainSearchTerms(q)} nutrition facts details review`, name, brand);
+    if (retryFresh.length > 0) {
+      fresh = [...retryFresh, ...fresh];
+      const second = await askModel();
+      // Only take the retry if it actually did better — never downgrade a
+      // usable first answer into a refusal.
+      if (second.basis !== "insufficient_info") ({ answer, basis } = second);
+    }
   }
 
   // Never trust the model's own "search" claim over what was actually
-  // retrieved — if the search genuinely returned nothing, there's nothing to
-  // cite regardless of what basis the model reported.
-  const reallyHasSearchContent = Boolean(search && (search.results?.length || search.answer));
-  const grounded = basis === "search" && reallyHasSearchContent;
+  // retrieved — if nothing was pooled, there's nothing to cite regardless of
+  // what basis the model reported.
+  const poolHasContent = pool.results.size > 0 || pool.summaries.length > 0;
+  const grounded = basis === "search" && poolHasContent;
+  // Cite this question's own fresh hits first, then the rest of the pool.
+  const cited = [...fresh, ...pool.results.values()]
+    .map((r) => r.url)
+    .filter(Boolean);
   return {
     answer,
     basis: grounded ? "search" : basis,
     grounded,
-    sourceUrls: grounded ? (search?.results || []).slice(0, 3).map((r) => r.url).filter(Boolean) : [],
+    sourceUrls: grounded ? [...new Set(cited)].slice(0, 3) : [],
   };
 }
 
