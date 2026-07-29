@@ -1017,9 +1017,11 @@ button:disabled {
   filter: grayscale(0.6);
 }
 
+/* Bottom-left, not top-left: the Explain button now occupies the top-left
+   corner of the photo (mirroring the ☆), and the two would overlap there. */
 .oos-badge {
   position: absolute;
-  top: 8px;
+  bottom: 8px;
   left: 8px;
   background: var(--text-dark);
   color: #fff;
@@ -1075,13 +1077,19 @@ button:disabled {
   padding-top: 8px;
 }
 
+/* min-width:0 + wrap so a wide discounted price ("₹1,299 ₹2,499") lets the
+   strikethrough MRP drop to a second line instead of shoving the Add button
+   out of the card — measured: without these, a 89px price pushed Add 12px
+   past the footer's right edge and into the card's padding. */
 .product-card-price {
   font-size: 0.92rem;
   font-weight: 800;
   color: var(--text-dark);
   display: flex;
   align-items: baseline;
-  gap: 5px;
+  flex-wrap: wrap;
+  gap: 0 5px;
+  min-width: 0;
 }
 
 .product-card-mrp {
@@ -1089,12 +1097,6 @@ button:disabled {
   font-weight: 500;
   color: var(--text-muted);
   text-decoration: line-through;
-}
-
-.product-card-buttons {
-  display: flex;
-  align-items: center;
-  gap: 6px;
 }
 
 .product-add-btn {
@@ -1106,6 +1108,8 @@ button:disabled {
   font-size: 0.82rem;
   font-weight: 800;
   letter-spacing: 0.02em;
+  /* never squeezed or pushed out by a long price — see .product-card-price */
+  flex-shrink: 0;
 }
 
 .product-add-btn:hover:not(:disabled) {
@@ -1113,20 +1117,28 @@ button:disabled {
   color: #fff;
 }
 
-/* "Explain" — opens ExplainModal, a web-grounded Q&A popup for this one
-   item. Deliberately never disabled by the out-of-stock/sending guards that
-   gate Add: researching an item you can't currently buy is still useful. */
+/* "Explain" — opens ExplainModal, a web-grounded Q&A popup for this one item.
+   Sits on the photo at top-LEFT, mirroring .product-card-star at top-right,
+   so the footer keeps its original price + Add layout (see the JSX comment:
+   in the footer it pushed Add out of the card on discounted prices).
+   Deliberately never disabled by the out-of-stock/sending guards that gate
+   Add — researching an item you can't currently buy is still useful. */
 .product-explain-btn {
+  position: absolute;
+  top: 6px;
+  left: 6px;
   width: 30px;
   height: 30px;
   padding: 0;
-  border: 1.5px solid var(--border-strong);
-  border-radius: 9px;
-  background: var(--bg);
+  border: none;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: var(--shadow-sm);
   color: var(--text-muted);
   display: grid;
   place-items: center;
-  flex-shrink: 0;
+  cursor: pointer;
+  transition: transform 0.12s, color 0.12s, background 0.12s;
 }
 
 .product-explain-btn svg {
@@ -1135,8 +1147,9 @@ button:disabled {
 }
 
 .product-explain-btn:hover {
-  border-color: var(--orange);
-  color: var(--orange-dark);
+  background: #fff;
+  color: var(--orange);
+  transform: scale(1.08);
 }
 
 /* shared image tile — product cards + cart rows */

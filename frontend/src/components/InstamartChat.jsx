@@ -776,6 +776,20 @@ function ProductCard({ product: p, disabled, saved, onAdd, onToggleSave }) {
       <div className="product-card-imgwrap">
         <ProductThumb src={p.imageUrl} alt={p.displayName} className="product-card-img" />
         {outOfStock && <span className="oos-badge">Out of stock</span>}
+        {/* Top-LEFT, mirroring the ☆ at top-right. Deliberately on the photo
+            rather than in the footer: alongside the Add button it made the
+            footer overflow the ~146px card once a discounted price showed a
+            strikethrough MRP ("₹300 ₹999"), and .product-card's
+            `overflow: hidden` then clipped Add off the card entirely. */}
+        <button
+          type="button"
+          className="product-explain-btn"
+          onClick={() => setExplainOpen(true)}
+          aria-label={`Ask about ${p.displayName}`}
+          title="Ask about this item"
+        >
+          <InfoIcon />
+        </button>
         <button
           type="button"
           className={`product-card-star${saved ? " product-card-star--saved" : ""}`}
@@ -797,25 +811,14 @@ function ProductCard({ product: p, disabled, saved, onAdd, onToggleSave }) {
             ₹{p.offerPrice ?? p.mrp}
             {hasDiscount && <span className="product-card-mrp">₹{p.mrp}</span>}
           </span>
-          <div className="product-card-buttons">
-            <button
-              type="button"
-              className="product-explain-btn"
-              onClick={() => setExplainOpen(true)}
-              aria-label={`Ask about ${p.displayName}`}
-              title="Ask about this item"
-            >
-              <InfoIcon />
-            </button>
-            <button
-              type="button"
-              className="product-add-btn"
-              onClick={onAdd}
-              disabled={disabled || outOfStock}
-            >
-              {outOfStock ? "N/A" : "Add"}
-            </button>
-          </div>
+          <button
+            type="button"
+            className="product-add-btn"
+            onClick={onAdd}
+            disabled={disabled || outOfStock}
+          >
+            {outOfStock ? "N/A" : "Add"}
+          </button>
         </div>
       </div>
       {explainOpen && <ExplainModal product={p} onClose={() => setExplainOpen(false)} />}
