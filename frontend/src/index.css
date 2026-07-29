@@ -1778,6 +1778,19 @@ button:disabled {
   text-decoration: underline;
 }
 
+/* Marks an answer that came from the model's own general knowledge, not a
+   web source specific to this listing — deliberately quieter/less confident-
+   looking than .explain-sources, since it isn't backed by a citation. */
+.explain-basis-note {
+  display: block;
+  margin-top: 7px;
+  padding-top: 7px;
+  border-top: 1px dashed var(--border);
+  font-size: 0.74rem;
+  font-style: italic;
+  color: var(--text-muted);
+}
+
 .explain-error {
   font-size: 0.8rem;
   color: var(--red);

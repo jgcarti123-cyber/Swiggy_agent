@@ -883,7 +883,13 @@ function ExplainModal({ product, onClose }) {
       const result = await api.instamartExplainItem(payload, q, history);
       setHistory([
         ...nextHistory,
-        { role: "assistant", content: result.answer, grounded: result.grounded, sourceUrls: result.sourceUrls || [] },
+        {
+          role: "assistant",
+          content: result.answer,
+          basis: result.basis,
+          grounded: result.grounded,
+          sourceUrls: result.sourceUrls || [],
+        },
       ]);
     } catch (err) {
       setError(err.message || "Couldn't get an answer");
@@ -943,7 +949,7 @@ function ExplainModal({ product, onClose }) {
           {history.map((h, i) => (
             <div key={i} className={`explain-msg explain-msg--${h.role}`}>
               <span className="explain-msg-text">{h.content}</span>
-              {h.role === "assistant" && h.sourceUrls?.length > 0 && (
+              {h.role === "assistant" && h.basis === "search" && h.sourceUrls?.length > 0 && (
                 <span className="explain-sources">
                   Sources:{" "}
                   {h.sourceUrls.map((u, j) => (
@@ -951,6 +957,19 @@ function ExplainModal({ product, onClose }) {
                       [{j + 1}]
                     </a>
                   ))}
+                </span>
+              )}
+              {/* Distinguishes a web-sourced answer from one recalled from the
+                  model's own training — confirmed live these need telling
+                  apart: "does this have caffeine?" used to be flatly refused
+                  because the search snippet didn't mention it, even though
+                  it's common knowledge. Now the model can answer from general
+                  knowledge instead of refusing, but the UI says so plainly
+                  rather than presenting it with the same confidence as a
+                  cited, product-specific search result. */}
+              {h.role === "assistant" && h.basis === "general_knowledge" && (
+                <span className="explain-basis-note">
+                  💭 General knowledge — not specific to this listing
                 </span>
               )}
             </div>

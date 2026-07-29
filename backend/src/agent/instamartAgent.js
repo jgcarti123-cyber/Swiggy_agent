@@ -208,12 +208,17 @@ const productBySku = new Map();
 // user is never invited to retry a dead end. Reset only by a backend restart.
 const knownOutOfStockIds = new Set();
 
-// One web search per spinId, reused across every question asked about that
-// item in the "Explain" popup — searching fresh per question would be both
-// slower and unnecessary, since the underlying product doesn't change
-// mid-conversation. `null` is cached too (search failed/unavailable) so a
-// failed search isn't retried on every follow-up question either. Reset only
-// by a backend restart, same lifetime as the other item-keyed caches here.
+// One web search per (item, exact question) pair in the "Explain" popup.
+// Originally this cached ONE generic search per item and reused it for every
+// question — cheaper, but confirmed live as a real quality bug: asking
+// "does this have caffeine in it?" about Coca-Cola Zero got refused, because
+// the one generic "product review ingredients nutrition" search never
+// happened to mention caffeine, and the model was told to only use what it
+// was given. A question-specific search (product + the actual question)
+// finds the actually-relevant content instead. `null` is cached too (search
+// failed/unavailable) so a failed search isn't retried on an identical
+// re-ask. Reset only by a backend restart, same lifetime as the other
+// item-keyed caches here.
 const itemSearchCache = new Map();
 
 function isKnownOutOfStock(spinId) {
@@ -2090,6 +2095,30 @@ export async function setItemQuantity({ addressId, spinId, skuId, quantity }) {
   }
 }
 
+const EXPLAIN_ANSWER_TOOL = {
+  type: "function",
+  function: {
+    name: "answer_question",
+    description: "Answer the user's question about this product, and report honestly what the answer is actually based on.",
+    parameters: {
+      type: "object",
+      properties: {
+        answer: {
+          type: "string",
+          description: "The answer, concise (2-4 sentences unless the question genuinely needs more detail).",
+        },
+        basis: {
+          type: "string",
+          enum: ["search", "general_knowledge", "insufficient_info"],
+          description:
+            "'search' if the web content given substantively supports the answer. 'general_knowledge' if the web content didn't cover it but the answer is your own well-established knowledge (e.g. product-line-wide facts, not obscure or specific to this exact listing). 'insufficient_info' if neither source gives a reliable answer — in this case the answer text should say so rather than guess.",
+        },
+      },
+      required: ["answer", "basis"],
+    },
+  },
+};
+
 // ---------------------------------------------------------------------------
 // Per-item "Explain" popup — web-grounded Q&A scoped to one product. Entirely
 // separate from the main cart-building chat (its own frontend-only modal, no
@@ -2102,13 +2131,16 @@ export async function explainItem({ spinId, skuId, displayName, brand, quantityD
   if (!q) return { error: "question is required" };
 
   const name = displayName || "this item";
-  const key = String(spinId || skuId || name);
+  const cacheKey = `${spinId || skuId || name}::${q.toLowerCase()}`;
 
-  let search = itemSearchCache.get(key);
+  // Searched per QUESTION, not once per item — see itemSearchCache's comment
+  // for why. Combining the product identity with the actual question is what
+  // makes the retrieved content relevant to what's actually being asked.
+  let search = itemSearchCache.get(cacheKey);
   if (search === undefined) {
-    const searchQuery = [name, brand].filter(Boolean).join(" ") + " ingredients nutrition review";
+    const searchQuery = `${[name, brand].filter(Boolean).join(" ")} ${q}`.trim();
     search = await searchWeb({ query: searchQuery }).catch(() => null);
-    itemSearchCache.set(key, search);
+    itemSearchCache.set(cacheKey, search);
   }
 
   const productLine = [
@@ -2132,10 +2164,30 @@ export async function explainItem({ spinId, skuId, displayName, brand, quantityD
   }
   const webContext = webParts.join("\n\n").slice(0, 6000);
 
+  // Confirmed live this priority order matters: an earlier version told the
+  // model to ONLY use the given content and refuse otherwise, which made it
+  // refuse "does Coca-Cola Zero have caffeine?" — a well-known fact — purely
+  // because that one search snippet didn't happen to mention caffeine. The
+  // fix isn't "trust the model unconditionally," it's an explicit order: real
+  // search content first (most reliable, specific to this exact listing),
+  // then genuine general knowledge (never refuse a well-known fact for lack
+  // of a citation), and only admit defeat when neither actually covers it —
+  // with `basis` reported honestly so the UI can show which one happened.
   const messages = [
     {
       role: "system",
-      content: `You answer questions about a specific Instamart product for the user shopping in this app. Be concise (2-4 sentences unless the question genuinely needs more). Ground your answer in the product details and web content below — if they don't cover what's asked, say so honestly rather than inventing ingredients, nutrition facts, or claims.\n\n${productLine}\n\n${webContext || "No web content is available for this item."}`,
+      content: `You answer questions about a specific Instamart product for the user shopping in this app.
+
+Answer using this priority order:
+1. If the web content below substantively covers the question, base your answer on it — it's specific to this exact product and the most reliable source.
+2. If it doesn't cover the question but the answer is well-established general knowledge (e.g. "Coca-Cola Zero contains caffeine" is true of the whole product line, not an obscure or product-specific detail), answer from your own knowledge rather than refusing. Do not refuse a well-known fact just because the search snippet didn't happen to mention it.
+3. Only say you don't have a reliable answer when NEITHER the web content nor your own general knowledge covers it with confidence — never invent a specific number, ingredient, or claim you're not sure of.
+
+Set "basis" honestly to whichever of the above you actually used. Call answer_question exactly once.
+
+${productLine}
+
+${webContext || "No web content was found for this question."}`,
     },
     ...(Array.isArray(history) ? history : [])
       .slice(-6)
@@ -2147,14 +2199,40 @@ export async function explainItem({ spinId, skuId, displayName, brand, quantityD
     model: config.groqModel,
     reasoning_effort: "low",
     messages,
+    tools: [EXPLAIN_ANSWER_TOOL],
+    tool_choice: { type: "function", function: { name: "answer_question" } },
     max_tokens: 512,
   });
 
-  const answer = completion.choices[0]?.message?.content?.trim() || "I couldn't find an answer to that.";
+  const choice = completion.choices[0];
+  let answer = "I couldn't find an answer to that.";
+  let basis = "insufficient_info";
+  if (choice.finish_reason === "tool_calls" && choice.message.tool_calls?.[0]) {
+    try {
+      const args = JSON.parse(choice.message.tool_calls[0].function.arguments || "{}");
+      if (args.answer) answer = String(args.answer).trim();
+      if (args.basis === "search" || args.basis === "general_knowledge" || args.basis === "insufficient_info") {
+        basis = args.basis;
+      }
+    } catch (err) {
+      console.error(`[explainItem] failed to parse tool call for "${q}": ${err.message}`);
+    }
+  } else if (choice.message?.content) {
+    // Model answered in plain text instead of calling the tool (shouldn't
+    // happen with tool_choice forced, but don't discard a real answer over it).
+    answer = choice.message.content.trim();
+  }
+
+  // Never trust the model's own "search" claim over what was actually
+  // retrieved — if the search genuinely returned nothing, there's nothing to
+  // cite regardless of what basis the model reported.
+  const reallyHasSearchContent = Boolean(search && (search.results?.length || search.answer));
+  const grounded = basis === "search" && reallyHasSearchContent;
   return {
     answer,
-    grounded: Boolean(search && (search.results?.length || search.answer)),
-    sourceUrls: (search?.results || []).slice(0, 3).map((r) => r.url).filter(Boolean),
+    basis: grounded ? "search" : basis,
+    grounded,
+    sourceUrls: grounded ? (search?.results || []).slice(0, 3).map((r) => r.url).filter(Boolean) : [],
   };
 }
 
