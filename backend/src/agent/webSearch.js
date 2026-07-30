@@ -12,7 +12,15 @@ const TAVILY_URL = "https://api.tavily.com/search";
 // "no grounding available" and fall back to the model's own knowledge — the
 // same fail-open posture every other optional LLM-helper in this app already
 // uses (see e.g. discoveryAgent.js). Never throw out of here.
-export async function searchWeb({ query, maxResults = 4 }) {
+//
+// `country` is Tavily's own result-boosting param (confirmed in their live
+// API reference: "Boost search results from a specific country... available
+// only if topic is general" — this app never sets `topic`, so it's always
+// the default "general"). This app is built specifically for an Indian
+// Instamart catalogue, so the recipe-grounding caller passes `country:
+// "india"` to bias results toward Indian recipe sources rather than
+// whatever a bare dish name happens to rank globally.
+export async function searchWeb({ query, maxResults = 4, country }) {
   if (!config.tavilyApiKey) return null;
   try {
     const res = await fetch(TAVILY_URL, {
@@ -26,6 +34,7 @@ export async function searchWeb({ query, maxResults = 4 }) {
         search_depth: "basic",
         max_results: maxResults,
         include_answer: "basic",
+        ...(country ? { country } : {}),
       }),
     });
     if (!res.ok) {

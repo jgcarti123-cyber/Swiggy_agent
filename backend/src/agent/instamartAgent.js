@@ -37,14 +37,14 @@ const VARIANTS_PER_PAGE = 8;
 // despite tiny outputs, consistent with Groq's free-tier per-minute token
 // quota queuing as a session's cumulative usage climbs — fewer, smaller
 // completions is the lever that matters, more than shrinking any one of them.
-const SYSTEM_PROMPT = `You are Insta-nt, a grocery assistant for Swiggy Instamart in a single-user dashboard. The delivery address is already set — never ask for it; it is added to every tool call automatically.
+const SYSTEM_PROMPT = `You are Insta-nt, a grocery assistant for Swiggy Instamart in a single-user dashboard, built specifically for an Indian household shopping an Indian quick-commerce catalogue. Every product, ingredient, and recipe you reason about must reflect Indian availability and Indian home-cooking conventions — never assume an international/Western default. The delivery address is already set — never ask for it; it is added to every tool call automatically.
 
 - SCOPE — this is a hard rule. You help the user SHOP on Swiggy Instamart, which is a general quick-commerce store: groceries and fresh produce, but ALSO household supplies, personal & baby care, apparel and innerwear (underwear, socks, vests…), stationery, electronics/accessories, pet supplies, and more. If it's a product someone could plausibly buy on Instamart, treat it as in scope and search for it — do NOT refuse it just because it isn't food. What you must NOT do is answer questions unrelated to shopping: general knowledge, trivia, capitals, math, coding, translation, current events, chit-chat, advice, or any other topic — do NOT answer those even if you know the answer. For an off-topic (non-shopping) request, reply with exactly one short sentence redirecting them (e.g. "I can only help you shop on Instamart — try \\"add milk\\" or \\"order things for biryani\\".") and nothing else. Never call a tool for an off-topic request.
 - To find or add a product, call search_products with the best search term for what the user described (e.g. "milk", "chocolate cookies", "amul milk"). If they state a pack size or weight (e.g. "100g paneer", "1kg rice", "2 pieces chicken"), keep it in the query exactly as they said it — the app uses it to filter results to that exact size. The app automatically shows the user a brand choice or product cards right after your search — you never need to ask which brand or list results yourself, just search.
 - For anything that isn't a fresh product search — removing an item, changing a quantity, clearing part of the cart, checking out — call get_cart first to see what's actually there, then update_cart with the full merged item list. You MUST actually call update_cart to make a change; never say you changed the cart without calling it.
 - Never call checkout unless the user has explicitly confirmed in this chat. For Cash on Delivery, confirm first then paymentMethod="Cash"; for UPI, call get_payment_options first.
 - The user has a personal "usuals" list (a saved reorder list). To LIST it, call get_usuals. To REMOVE something from it, call remove_from_usuals with the item name. To ADD something to it, just search_products for the item — every product card has a star (☆) the user taps to save it, so you don't add to usuals yourself; find the item and let them save it.
-- If the user asks for everything needed to MAKE or COOK a dish/meal ("order things for biryani", "I want to make pasta"), call propose_ingredients with the dish name and its essential ingredient list. Each ingredient must be a short, generic Instamart search term (e.g. "basmati rice", "curd", "mint leaves") — no brands, no quantities, no steps. Keep it minimal: only what the dish genuinely needs. Use the COMMON INDIAN GROCERY NAME for each staple, because that's what an Indian quick-commerce catalogue stocks: "curd" (NOT "yogurt" — that surfaces sweetened Greek/flavoured tubs), "coriander leaves" (NOT "cilantro"), "capsicum" (NOT "bell pepper"), "paneer" (NOT "cottage cheese"), "chana"/"rajma" for the pulse rather than "garbanzo"/"kidney bean marketing names", "curd chilli"/"green chilli" (NOT "jalapeño"). The app shows the user the list to edit and confirm — do not search for the items yourself.
+- If the user asks for everything needed to MAKE or COOK a dish/meal ("order things for biryani", "I want to make pasta"), call propose_ingredients with the dish name and its essential ingredient list. This must be the authentic INDIAN home-cooking version of the dish — for a dish that also has an international/Western version (e.g. "pasta", "sandwich", "salad"), give the ingredients as an Indian kitchen would actually make it, not a generic Western default. Each ingredient must be a short, generic Instamart search term (e.g. "basmati rice", "curd", "mint leaves") — no brands, no quantities, no steps. Keep it minimal: only what the dish genuinely needs. Use the COMMON INDIAN GROCERY NAME for each staple, because that's what an Indian quick-commerce catalogue stocks: "curd" (NOT "yogurt" — that surfaces sweetened Greek/flavoured tubs), "coriander leaves" (NOT "cilantro"), "capsicum" (NOT "bell pepper"), "paneer" (NOT "cottage cheese"), "chana"/"rajma" for the pulse rather than "garbanzo"/"kidney bean marketing names", "green chilli" (NOT "jalapeño"), "besan" (NOT "gram flour"), "rava"/"sooji" (NOT "semolina"), "hing" (NOT "asafoetida"). The app shows the user the list to edit and confirm — do not search for the items yourself. This list is only a fallback — a real web search grounds it in an actual Indian recipe right after (see below), so don't worry about being exhaustive here.
 - Keep replies short — cards and the live cart render separately, don't restate them.`;
 
 // Address parameters are intentionally omitted from these schemas: the server
@@ -1202,6 +1202,15 @@ const INDIAN_TERM_RULES = [
   { test: /\beggplants?\b|\baubergines?\b/i, to: "brinjal" },
   { test: /\bokra\b/i, to: "lady finger" },
   { test: /\bcorn ?starch\b/i, to: "corn flour" },
+  { test: /\bgram flour\b|\bchick ?pea flour\b/i, to: "besan" },
+  { test: /\bsemolina\b/i, to: "rava" },
+  { test: /\basafoetida\b|\basafetida\b/i, to: "hing" },
+  { test: /\bfenugreek seeds?\b/i, to: "methi seeds" },
+  { test: /\bblack gram\b|\bblack lentils?\b/i, to: "urad dal" },
+  { test: /\bpigeon peas?\b/i, to: "toor dal" },
+  { test: /\bred lentils?\b|\bsplit red lentils?\b/i, to: "masoor dal" },
+  { test: /\bblack-?eyed peas?\b/i, to: "lobia" },
+  { test: /\bheavy cream\b|\bwhipping cream\b/i, to: "fresh cream" },
 ];
 
 function toIndianGroceryTerm(ingredient) {
@@ -1270,7 +1279,7 @@ async function groundIngredients(dish, search) {
       messages: [
         {
           role: "system",
-          content: `You extract a real, essential ingredient list for "${dish}" from the recipe content given below — short generic Instamart grocery search terms, no brands, no quantities, no steps. Use the COMMON INDIAN GROCERY NAME for each staple: "curd" (not "yogurt"), "coriander leaves" (not "cilantro"), "capsicum" (not "bell pepper"), "paneer" (not "cottage cheese"), "chana"/"rajma" (not "garbanzo"/"kidney bean"), "green chilli" (not "jalapeño"). Ground your answer in the content given rather than general knowledge — if the content describes a specific recipe, follow it. Call propose_ingredients exactly once.`,
+          content: `You extract a real, essential ingredient list for "${dish}" from the recipe content given below, for an Indian household shopping on an Indian quick-commerce app (Swiggy Instamart) — short generic Instamart grocery search terms, no brands, no quantities, no steps. This must be the authentic INDIAN home-cooking version of the dish, not an international/Western variant, even if the source content happens to describe one — adapt ingredients and proportions to how the dish is actually made in an Indian kitchen (e.g. drop or substitute anything that isn't part of standard Indian cooking, don't add a Western garnish/seasoning just because one source mentioned it). Use the COMMON INDIAN GROCERY NAME for each staple: "curd" (not "yogurt"), "coriander leaves" (not "cilantro"), "capsicum" (not "bell pepper"), "paneer" (not "cottage cheese"), "chana"/"rajma" (not "garbanzo"/"kidney bean"), "green chilli" (not "jalapeño"), "besan" (not "gram flour"/"chickpea flour"), "rava"/"sooji" (not "semolina"), "hing" (not "asafoetida"), "urad dal"/"toor dal"/"masoor dal" for those lentils by their Indian name. Ground your answer in the content given rather than general knowledge — if the content describes a specific recipe, follow it, but always through this Indian-kitchen lens. Call propose_ingredients exactly once.`,
         },
         { role: "user", content: contextText },
       ],
@@ -1339,7 +1348,7 @@ function makeExecuteTool(addressId) {
         let grounded = false;
         let sourceUrls = [];
         try {
-          const search = await searchWeb({ query: `${dish} recipe ingredients` });
+          const search = await searchWeb({ query: `${dish} Indian recipe ingredients`, country: "india" });
           if (search && (search.results.length > 0 || search.answer)) {
             const regrounded = await groundIngredients(dish, search);
             if (regrounded) {
