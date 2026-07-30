@@ -320,6 +320,7 @@ function flattenVariants(raw, goToIndex) {
         displayName,
         inStock: v.isInStockAndAvailable !== false && !isKnownOutOfStock(v.spinId),
         price: v.price?.offerPrice ?? v.price?.mrp ?? null,
+        quantityDescription: v.quantityDescription || null,
         mostOrdered: rank !== undefined,
         orderRank: rank,
       });
@@ -735,7 +736,10 @@ function sortForBestPick(variants) {
 // cheapest by price. `sortForBestPick` already selected these N by relevance
 // (§chicken-vs-masala: the ₹46 masala packet never reaches the top 3, so
 // "cheapest of the 3" can't resurrect it), so this only decides WHICH of the
-// genuinely-relevant options to add.
+// genuinely-relevant options to add. Used by the recipe flow (§6.13) and,
+// only when a screenshot item carried no parseable size, the import flow —
+// see sortForImportPick below for the size-aware ranking used everywhere
+// else in the import flow, which is deliberately NOT built on this function.
 function orderBestFirst(refs) {
   if (refs.length <= 1) return refs;
   const mostOrdered = refs.filter((r) => r.mostOrdered);
@@ -743,6 +747,66 @@ function orderBestFirst(refs) {
     ? mostOrdered.reduce((a, b) => ((a.orderRank ?? 0) <= (b.orderRank ?? 0) ? a : b))
     : refs.reduce((a, b) => ((a.price ?? Infinity) <= (b.price ?? Infinity) ? a : b));
   return [best, ...refs.filter((r) => r !== best)];
+}
+
+// A variant's own multipack count ("450 g x 2" -> 2, "450 g" -> 1). Used only
+// by sortForImportPick below.
+const PACK_MULTIPLIER_PATTERN = /x\s*(\d+)/i;
+function packMultiplier(desc) {
+  const m = String(desc || "").match(PACK_MULTIPLIER_PATTERN);
+  return m ? parseInt(m[1], 10) : 1;
+}
+
+function quantityDistance(desc, requested) {
+  const actual = parseQuantityFrom(desc);
+  if (!actual || actual.family !== requested.family) return Infinity;
+  return Math.abs(actual.value - requested.value);
+}
+
+// Ranking used ONLY by the import-from-screenshot flow (confirmImportDirect)
+// — both for which exact-size match auto-adds and for ordering the "no exact
+// match, pick one" swap options. Deliberately a DIFFERENT priority order than
+// orderBestFirst/sortForBestPick's app-wide "most ordered by you wins even if
+// pricier" rule (the user's explicit choice for this picker, confirmed live):
+// here, closeness to the screenshot's own size/pack wins first, "most ordered
+// by you" is only a tiebreak, not the top signal.
+//
+// Two real bugs this fixes, both confirmed live against the real account:
+// 1. A 330 ml Diet Coke import with no Diet Coke in stock fell back to
+//    Coca-Cola Zero, but the swap options shown were 300 ml x6/x4/x2
+//    multipacks (₹234/₹156/₹78) ahead of a plain 300 ml single can (~₹40) —
+//    Swiggy's relevance order isn't quantity-aware.
+// 2. Worse: a 450 g chicken import had BOTH a 450 g single pack (₹145) and a
+//    450 g x2 pack (₹290) as genuine exact-size matches, and it silently
+//    auto-added the ₹290 two-pack — because this specific real account's own
+//    order history (your_go_to_items) ranks the two-pack above the single
+//    (each pack size is its own separate, genuinely-ranked go-to entry, not
+//    a data glitch), and the old "most ordered wins outright" rule took that
+//    at face value even though the screenshot only showed one single item.
+// Rank by |own pack size - requested size| within the same family (weight/
+// volume/count) first, reusing parseQuantityFrom's per-pack parsing (a
+// multipack's "x N" is ignored there, so a 6-pack of 300 ml cans compares on
+// 300 ml, not 1800 ml); then by pack multiplier ascending (prefer the single
+// unit over an otherwise-same-size multipack); mostOrdered/orderRank and
+// price are just the final tiebreaks among genuinely-tied options. A variant
+// whose size can't be parsed, or is a different family, sorts to the back
+// rather than being excluded, so a real option is never dropped outright.
+function sortForImportPick(variants, requested) {
+  return [...variants].sort((a, b) => {
+    if (requested) {
+      const distDiff = quantityDistance(a.quantityDescription, requested) - quantityDistance(b.quantityDescription, requested);
+      if (distDiff !== 0) return distDiff;
+      const multDiff = packMultiplier(a.quantityDescription) - packMultiplier(b.quantityDescription);
+      if (multDiff !== 0) return multDiff;
+    }
+    const moDiff = (b.mostOrdered ? 1 : 0) - (a.mostOrdered ? 1 : 0);
+    if (moDiff !== 0) return moDiff;
+    if (a.mostOrdered && b.mostOrdered) {
+      const rankDiff = (a.orderRank ?? 0) - (b.orderRank ?? 0);
+      if (rankDiff !== 0) return rankDiff;
+    }
+    return (a.price ?? Infinity) - (b.price ?? Infinity);
+  });
 }
 
 function plainTokens(text) {
@@ -1971,10 +2035,17 @@ export async function confirmImportDirect({ items, addressId }) {
         const sizeMatched = req ? allInStock.filter((v) => quantityMatches(req, v.quantityDescription)) : allInStock;
         const exact = item.size ? sizeMatched.length > 0 : allInStock.length > 0;
 
-        const source = exact ? sizeMatched : allInStock;
-        // Top-3, then reorder so the auto-add pick (cheapest, or a past-ordered
-        // match) is first — options[0] is what an exact match auto-adds.
-        const options = enrichProducts(orderBestFirst(source.slice(0, OPTIONS_PER_INGREDIENT)));
+        // Rank by closeness to the screenshot's own size/pack (see
+        // sortForImportPick) rather than Swiggy's raw relevance order or the
+        // app-wide "most ordered by you" priority, so neither a stray
+        // multipack nor a differently-sized past purchase can outrank the
+        // option that actually matches what was in the picture — applies to
+        // BOTH branches: which exact match auto-adds, and how the "no exact
+        // match, pick one" swap options are ordered. Falls back to
+        // orderBestFirst only when no size was extracted to compare against.
+        const candidates = exact ? sizeMatched : allInStock;
+        const ranked = req ? sortForImportPick(candidates, req) : orderBestFirst(candidates);
+        const options = enrichProducts(ranked.slice(0, OPTIONS_PER_INGREDIENT));
         return {
           ingredient: label,
           quantity: item.quantity,
