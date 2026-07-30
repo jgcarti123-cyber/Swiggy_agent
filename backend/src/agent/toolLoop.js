@@ -25,6 +25,17 @@ export async function runToolLoop({
   finalToolNames = [],
   maxIterations = 12,
   maxTokens = 4096,
+  // Forces this exact tool on iteration 0 only (falls back to "auto" from
+  // iteration 1 on, same as if it had never been set) — for callers that
+  // deterministically already know the model's free choice ("auto") isn't
+  // reliable enough for this specific message. See sendMessage's
+  // looksLikeRecipeRequest gate for the motivating case: with plain "auto",
+  // Groq skipped calling propose_ingredients on roughly 1 in 3 identical
+  // "order things for making biryani" requests, replying with a plain-text
+  // ingredient list instead (no checklist UI, nothing addable) — confirmed
+  // live, and confirmed to predate every other change in this file via
+  // `git stash` before writing this fix.
+  forceToolName = null,
 }) {
   const finalSet = new Set(Array.isArray(finalToolNames) ? finalToolNames : [finalToolNames].filter(Boolean));
   const executedTools = [];
@@ -35,14 +46,38 @@ export async function runToolLoop({
     // prompt cost, logged alongside Groq's real usage numbers so a spike in
     // either (bigger transcript vs. bigger tool schema) is easy to tell apart.
     const requestChars = JSON.stringify(messages).length + JSON.stringify(tools).length;
-    const completion = await createCompletionWithRetry({
-      model: config.groqModel,
-      reasoning_effort: "low",
-      messages,
-      tools,
-      tool_choice: "auto",
-      max_tokens: maxTokens,
-    });
+    const toolChoice = i === 0 && forceToolName ? { type: "function", function: { name: forceToolName } } : "auto";
+    let completion;
+    try {
+      completion = await createCompletionWithRetry({
+        model: config.groqModel,
+        reasoning_effort: "low",
+        messages,
+        tools,
+        tool_choice: toolChoice,
+        max_tokens: maxTokens,
+      });
+    } catch (err) {
+      // Groq intermittently 400s a forced tool_choice with "Tool choice is
+      // required, but model did not call a tool" (same failure mode already
+      // handled for Explain's forced answer_question call in
+      // instamartAgent.js) — on that specific error only, retry once unforced
+      // rather than aborting the whole turn. Nothing has been pushed to
+      // `messages` yet at this point, so reissuing the identical request is
+      // safe.
+      if (toolChoice !== "auto" && err?.status === 400 && /tool choice is required/i.test(err?.message || "")) {
+        completion = await createCompletionWithRetry({
+          model: config.groqModel,
+          reasoning_effort: "low",
+          messages,
+          tools,
+          tool_choice: "auto",
+          max_tokens: maxTokens,
+        });
+      } else {
+        throw err;
+      }
+    }
     const completionMs = Date.now() - t0;
 
     const message = completion.choices[0].message;

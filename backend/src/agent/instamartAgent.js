@@ -1499,6 +1499,40 @@ function looksOffTopic(userText) {
 const OFFTOPIC_REPLY =
   'I can only help you shop on Instamart — try "add milk", "order things for biryani", or attach a cart screenshot.';
 
+// ---------------------------------------------------------------------------
+// Recipe-intent pre-gate — NOT for refusing anything (unlike looksOffTopic
+// above), but for forcing tool_choice on propose_ingredients for messages
+// that unmistakably want a recipe/ingredient list. With plain tool_choice:
+// "auto" (toolLoop.js's default), Groq was measured skipping the tool call
+// entirely on roughly 1 in 3 identical "order things for making biryani"
+// requests — replying with a plain-text ingredient list instead (no
+// checklist UI, nothing addable), and once observed calling get_cart/
+// search_products instead. Confirmed via `git stash` that this predates
+// every other change in this file, i.e. genuine Groq/model flakiness on
+// tool_choice: "auto", not something introduced elsewhere.
+//
+// Deliberately HIGH-PRECISION like looksOffTopic: only the phrasings the
+// app's own SYSTEM_PROMPT already uses as its canonical examples ("order
+// things for biryani", "I want to make pasta") plus a few obvious variants —
+// a miss here just means the model decides for itself as before (same
+// flakiness risk, not a regression), so there's no cost to staying narrow.
+// A false positive would force propose_ingredients on a message that wasn't
+// really about a dish, which is the reason this stays conservative rather
+// than trying to catch every possible phrasing.
+const RECIPE_INTENT_PATTERNS = [
+  /\b(order|get|buy)\b[\s\S]{0,20}\b(things?|stuff|items?|ingredients?|everything)\b[\s\S]{0,20}\bfor\b/i,
+  /\bingredients?\s+(for|to make)\b/i,
+  /\b(want|need|help me)\s+(to\s+)?(make|cook|prepare)\b/i,
+  /\brecipe\s+(for|of)\b/i,
+  /\bhow (do i|to)\s+(make|cook|prepare)\b/i,
+];
+
+function looksLikeRecipeRequest(userText) {
+  const t = String(userText || "").trim().toLowerCase();
+  if (!t) return false;
+  return RECIPE_INTENT_PATTERNS.some((re) => re.test(t));
+}
+
 export async function sendMessage(userText, addressId, displayText = userText) {
   displayTranscript.push({ role: "user", text: displayText });
 
@@ -1546,6 +1580,7 @@ export async function sendMessage(userText, addressId, displayText = userText) {
     tools: TOOLS,
     executeTool: makeExecuteTool(addressId),
     maxTokens: 1024,
+    forceToolName: looksLikeRecipeRequest(userText) ? "propose_ingredients" : null,
   });
 
   const { entry, responsePayload } = buildFromBranch(finalToolName, finalArgs, text);
