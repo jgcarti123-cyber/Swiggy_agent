@@ -15,18 +15,58 @@ Not a product, not multi-tenant — this is one person's own dashboard for their
 
 ## Insta-nt in action
 
-<!--
-  Screenshots go in docs/screenshots/ — see docs/screenshots/SHOTLIST.md for the
-  exact steps to reproduce each one (search terms, click order, what should
-  render). Replace this comment block with the four <img> rows once captured.
--->
+### Guided search
 
-| | |
-|---|---|
-| ![Guided brand picker → product grid](docs/screenshots/insta-nt-brand-picker.png) | ![Per-item Explain popup, web-grounded answer with sources](docs/screenshots/insta-nt-explain.png) |
-| *"add milk" → deterministic brand question → product cards, zero LLM calls after the first* | *The ℹ️ "Explain" popup: a real, sourced answer — not a guess* |
-| ![Recipe flow grounded in a real web recipe](docs/screenshots/insta-nt-recipe.png) | ![Live cart reflecting real Swiggy state](docs/screenshots/insta-nt-cart.png) |
-| *"order things for making biryani" — ingredient list grounded in an actual recipe, not just model recall* | *The cart panel always reflects the real, verified Swiggy cart — never a guess from "the call didn't throw"* |
+"add milk" is broad enough that Instamart returns half a dozen brands — so instead of guessing, Insta-nt asks. All of this is deterministic backend code, not a model decision (see Highlights above).
+
+![Brand picker → product grid for "add milk"](docs/screenshots/Search_1.png)
+*"add milk" → a brand question (Amul flagged "most ordered by you" from real order history) → product cards, in one guided flow.*
+
+![Scrolled grid + add confirmation](docs/screenshots/Search_2.png)
+*The rest of the same grid, ending with "Added Amul Moti Toned Milk to your cart ✓" — a real, cart-verified confirmation that the item actually landed, not just a claim that the call didn't throw.*
+
+### Per-item Explain — grounded Q&A, not a guess
+
+An ℹ️ on any product card opens a scoped Q&A about that one item, backed by real web search rather than the model's memory.
+
+![Explain modal answering a diabetic-safety question with sources](docs/screenshots/info_1.png)
+*"is this good for a diabetic?" on Amul Taaza Milk — a grounded answer with the actual sugar-content figure and `[1][2][3]` sources.*
+
+![Explain modal on a bedsheet, showing both answer types](docs/screenshots/info_2.png)
+*Insta-nt sells more than groceries — same Explain popup, now on a bedsheet. Two different answer types in one thread: a comparison question ("satin vs cotton for winter") gets a **"💭 General knowledge — not specific to this listing"** answer, honestly labeled as recalled rather than sourced; the follow-up ("what are the measurements") gets a precise, product-specific answer instead. The distinction is deliberate — a cited fact and a recalled one are never shown the same way.*
+
+### Recipe grounding
+
+Broad, multi-item requests ("order things for making biryani") get grounded in a real recipe pulled from the web, not just whatever ingredients the model recalls.
+
+![16-ingredient biryani checklist grounded in real recipes](docs/screenshots/recipe_1.png)
+*"order things for making biryani" → a 16-ingredient checklist with a "🔎 Based on real recipes from the web — [1][2][3]" note.*
+
+![Per-ingredient results with swap alternatives](docs/screenshots/recipe_2.png)
+*After confirming: each ingredient is searched and auto-matched independently (Cinnamon, Cloves, Cardamom, Bay Leaf all shown "✓ In cart") — and each one explicitly shows its **2 runner-up alternatives with a Swap button**, so a wrong auto-pick is a one-click fix, not a re-order.*
+
+![Final live cart with 12 ingredients plus edits](docs/screenshots/recipe_3.png)
+*The finished cart: all 12 biryani ingredients plus a chicken cut, ₹596 total — including a couple of items swapped away from the auto-pick, since a few of the first-choice matches weren't quite right and got corrected here.*
+
+### Usuals + daily auto-add
+
+A locally editable "usuals" list (☆ to save any product), separate from Swiggy's own read-only order history.
+
+![My Usuals panel with 4 saved items and the auto-add schedule](docs/screenshots/usuals.png)
+*4 saved usuals, "Reorder now," and a daily auto-add toggle — including an honest "Auto-add on 2026-07-29 was missed — the app wasn't running at the scheduled time" notice rather than silently pretending it ran.*
+
+### Import from a screenshot
+
+A cart from any other quick-commerce app can be uploaded as a screenshot and reproduced here — read once by a vision model, then handled by the exact same deterministic search/match pipeline as a typed order.
+
+![Screenshot staged for import in the chat input](docs/screenshots/dup_1.png)
+*The empty Insta-nt welcome state, with a cart screenshot from another app staged in the input ("replicate this order") — nothing uploads until Send is actually pressed.*
+
+![Editable import checklist read off the screenshot](docs/screenshots/dup_2.png)
+*5 items read off that screenshot into an editable checklist (quantity steppers, remove) — nothing touches the cart until this is confirmed.*
+
+![Import results showing exact matches and a no-exact-match fallback](docs/screenshots/dup_3.png)
+*After confirming: 4 of 5 items resolved to a genuine same-size, in-stock match and were auto-added ("✓ In cart"). The 5th (a steel bottle) had **no exact match in stock**, so instead of silently guessing or picking something wrong, it explicitly shows "No exact match — pick one" with 3 real alternatives to choose from.*
 
 ## Why this exists
 
