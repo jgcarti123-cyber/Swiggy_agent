@@ -1899,6 +1899,7 @@ export async function importImageDirect({ image, note }) {
     // Vision runs on Groq, not Swiggy — this won't be a reauth case, but the
     // guard is harmless and keeps the pattern uniform.
     rethrowIfReauth(err);
+    console.error("[importImageDirect] vision call failed:", err?.status, err?.message, err?.error || "");
     const reply = "I couldn't read that image — try a clearer screenshot of the cart or item list.";
     displayTranscript.push({ role: "assistant", text: reply });
     trimConversation();

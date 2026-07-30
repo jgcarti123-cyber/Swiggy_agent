@@ -10,10 +10,12 @@ export const config = {
   // since Groq's supported-model list shifts.
   groqModel: process.env.GROQ_MODEL || "openai/gpt-oss-120b",
   // Separate vision-capable model for the "import from a screenshot" feature —
-  // gpt-oss-120b has no image input. llama-4-scout is Groq's multimodal model
-  // (confirmed in both the vision docs and the live models table). Overridable
-  // since Groq's model list shifts and this one is a preview model.
-  groqVisionModel: process.env.GROQ_VISION_MODEL || "meta-llama/llama-4-scout-17b-16e-instruct",
+  // gpt-oss-120b has no image input. llama-4-scout (the original default here)
+  // was retired by Groq without notice — confirmed live, calling it now 404s
+  // with "model_not_found". qwen/qwen3.6-27b is Groq's current (and only,
+  // per the live /models list) vision-capable model — confirmed by direct
+  // API test. Overridable since Groq's model list shifts.
+  groqVisionModel: process.env.GROQ_VISION_MODEL || "qwen/qwen3.6-27b",
   // Optional — see .env.example. Both the recipe-grounding and per-item
   // "Explain" features degrade to their pre-web-search behavior when blank.
   tavilyApiKey: process.env.TAVILY_API_KEY || "",

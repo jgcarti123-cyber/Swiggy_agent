@@ -39,6 +39,12 @@ export async function extractItemsFromImage(dataUrl, instructions) {
     model: config.groqVisionModel,
     temperature: 0,
     max_tokens: 1200,
+    // qwen3.6-27b defaults to "thinking mode" (a <think>...</think> preamble
+    // before the real answer) — confirmed live this burns the whole max_tokens
+    // budget on reasoning text and returns truncated/no JSON. This is a plain
+    // extraction task with no real reasoning needed, so turn thinking off;
+    // confirmed live this returns the bare JSON object directly.
+    reasoning_effort: "none",
     response_format: { type: "json_object" },
     messages: [
       {
