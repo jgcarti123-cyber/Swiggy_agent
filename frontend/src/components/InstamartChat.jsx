@@ -116,7 +116,7 @@ function downscaleImage(file, maxEdge = 1600, quality = 0.82) {
 // "Almost there…" restarting as "Thinking…" reads like a hang).
 const THINKING_LINES = ["Thinking…", "Searching Instamart…", "Checking prices…", "Sorting the good stuff…", "Almost there…"];
 
-export function InstamartChat() {
+export function InstamartChat({ isActive = true }) {
   const [hasAddress, setHasAddress] = useState(false);
   const [messages, setMessages] = useState([]);
   const [cart, setCart] = useState(null);
@@ -130,6 +130,13 @@ export function InstamartChat() {
   const [reauthError, setReauthError] = useState(null);
   const scrollRef = useRef(null);
   const fileInputRef = useRef(null);
+  // Read by the polling effect below without needing `sending` in its
+  // dependency array — that would tear down and restart the interval on
+  // every send, which is harmless but pointless churn.
+  const sendingRef = useRef(false);
+  useEffect(() => {
+    sendingRef.current = sending;
+  }, [sending]);
 
   useEffect(() => {
     if (!sending) {
@@ -154,6 +161,49 @@ export function InstamartChat() {
     api.instamartUsuals().then((r) => setUsuals(r.usuals || [])).catch(() => {});
     api.instamartUsualsSchedule().then((s) => setSchedule(s)).catch(() => {});
   }, []);
+
+  // Background cart polling. get_cart already reflects anything added from
+  // OUTSIDE this app (e.g. the real Instamart phone app) — Swiggy's cart is
+  // the single source of truth, there's no local mirror to go stale. The
+  // actual gap was that this frontend only ever re-fetched it after ITS OWN
+  // mutations, so an external change wouldn't show up here until the next
+  // local action or a full reload. Polling closes that gap.
+  //
+  // Scoped to when it's actually useful: only while this panel is the one
+  // visible (`isActive`, passed down from App.jsx's tab state) and the
+  // browser tab itself has focus (`document.hidden`) — no point spending
+  // calls refreshing a cart nobody's looking at. Skipped entirely while a
+  // message is in flight (`sendingRef`) so a background tick can never race
+  // the fresh cart a just-completed action already returned — checked via a
+  // ref, not `sending` itself, so the interval doesn't need tearing down and
+  // restarting on every send.
+  useEffect(() => {
+    if (!isActive || !hasAddress) return undefined;
+
+    let cancelled = false;
+
+    async function poll() {
+      if (document.hidden || sendingRef.current) return;
+      try {
+        const c = await api.instamartCart();
+        if (!cancelled) setCart(c);
+      } catch (err) {
+        // A background refresh failing shouldn't clobber an already-good,
+        // already-displayed cart with an error state — that would read as
+        // the cart "breaking" every ~12s on any transient hiccup. The one
+        // exception is a genuinely expired token: that's real and actionable
+        // regardless of what triggered the check.
+        if (!cancelled && isReauthError(err)) setReauthError(err.message);
+      }
+    }
+
+    poll(); // refresh immediately on becoming the active panel, not after a full interval
+    const id = setInterval(poll, 12000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [isActive, hasAddress]);
 
   // Scroll the transcript container itself, NOT via scrollIntoView on a
   // sentinel: scrollIntoView walks every scrollable ancestor, so with the chat
