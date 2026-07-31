@@ -28,3 +28,8 @@ npm-debug.log*
 .idea
 .DS_Store
 *.local
+
+# Original Cabinet Grotesk vendor drop (OTF/TTF/EOT/WOFF for every weight,
+# ~1.9MB). The app loads exactly one file from it — the variable woff2 — which
+# is committed at frontend/public/fonts/ alongside the FFL license.
+CabinetGrotesk_Complete/

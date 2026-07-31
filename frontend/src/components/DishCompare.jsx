@@ -352,6 +352,9 @@ function ItemRow({ item, dish, restaurantId, restaurantName, cart, onAdd }) {
           </div>
         )}
 
+        {/* Both dish actions share one row — stacked, they ate vertical space
+            and read as two unrelated controls rather than a primary action
+            with a secondary one beside it. Wraps on narrow widths. */}
         <div className="item-actions">
           <button
             type="button"
@@ -361,15 +364,14 @@ function ItemRow({ item, dish, restaurantId, restaurantName, cart, onAdd }) {
           >
             {adding ? "Adding…" : inCartQty > 0 ? `Add another (${inCartQty} in cart)` : "Add to cart"}
           </button>
+          {!coupon && (
+            <button className="deal-button" onClick={checkDeal} disabled={checking} type="button">
+              {checking ? "Checking best deal…" : "Check best coupon & real price"}
+            </button>
+          )}
         </div>
 
         {addError && <p className="error-text">{addError}</p>}
-
-        {!coupon && (
-          <button className="deal-button" onClick={checkDeal} disabled={checking} type="button">
-            {checking ? "Checking best deal…" : "Check best coupon & real price"}
-          </button>
-        )}
 
         {couponError && <p className="error-text">{couponError}</p>}
 

@@ -30,6 +30,33 @@ function InfoIcon() {
   );
 }
 
+// Send — a paper plane. Replaces the "Send" text label so the composer's two
+// ends are matching circular icon buttons instead of a circle and a pill.
+function SendIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M22 2 11 13M22 2l-7 20-4-9-9-4 20-7z" />
+    </svg>
+  );
+}
+
+// Shopping-bag glyph for the empty state's avatar — same family as the
+// sidebar's Insta-nt icon so the panel reads as one identity.
+function BagIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z" />
+      <path d="M3 6h18M16 10a4 4 0 0 1-8 0" />
+    </svg>
+  );
+}
+
+// Tap-to-try starters for the empty state. These are the app's own canonical
+// example phrasings (they match SYSTEM_PROMPT's examples and the recipe
+// pre-gate), so a first-time user lands on a working path rather than
+// guessing at what the agent understands.
+const CHAT_STARTERS = ["add milk", "order things for making biryani", "add Amul Taaza 500ml"];
+
 // Turn a /chat response into a renderable transcript message.
 function assistantMessageFromResult(result) {
   if (result.choice) {
@@ -101,7 +128,7 @@ export function InstamartChat() {
   const [thinkingStep, setThinkingStep] = useState(0);
   const [error, setError] = useState(null);
   const [reauthError, setReauthError] = useState(null);
-  const bottomRef = useRef(null);
+  const scrollRef = useRef(null);
   const fileInputRef = useRef(null);
 
   useEffect(() => {
@@ -128,8 +155,14 @@ export function InstamartChat() {
     api.instamartUsualsSchedule().then((s) => setSchedule(s)).catch(() => {});
   }, []);
 
+  // Scroll the transcript container itself, NOT via scrollIntoView on a
+  // sentinel: scrollIntoView walks every scrollable ancestor, so with the chat
+  // card now sized to the viewport it dragged the whole page down on each new
+  // message. Setting scrollTop only ever moves this one element.
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
   }, [messages, sending]);
 
   // Shared by every user action (typed message, Add-button click, quick
@@ -355,15 +388,30 @@ export function InstamartChat() {
 
       <div className="instamart-layout">
         <div className="chat-column">
-          <div className="chat-messages">
+          <div className="chat-messages" ref={scrollRef}>
             {messages.length === 0 && !sending && (
               <div className="chat-empty">
-                <p className="chat-empty-title">👋 Hi, I'm Insta-nt</p>
-                <p className="muted">
-                  Try <em>"add milk"</em> and I'll ask which brand, say exactly what you want like{" "}
-                  <em>"add Amul Taaza 500ml"</em>, or go big: <em>"order things for making biryani"</em>. You can also
-                  attach a cart screenshot from another app using the icon by the message box.
+                <div className="chat-empty-avatar" aria-hidden="true">
+                  <BagIcon />
+                </div>
+                <p className="chat-empty-title">Hi, I'm Insta-nt</p>
+                <p className="chat-empty-sub">
+                  Tell me what you need in plain words — I'll find the right brand and size, and you can attach a cart
+                  screenshot from another app with the <strong>+</strong> button.
                 </p>
+                <div className="chat-starters">
+                  {CHAT_STARTERS.map((s) => (
+                    <button
+                      key={s}
+                      type="button"
+                      className="chat-starter"
+                      onClick={() => sendMsg(s)}
+                      disabled={sending || !hasAddress}
+                    >
+                      {s}
+                    </button>
+                  ))}
+                </div>
               </div>
             )}
 
@@ -395,69 +443,104 @@ export function InstamartChat() {
                 </span>
               </div>
             )}
-            <div ref={bottomRef} />
           </div>
 
-          {error && <p className="error-text">{error}</p>}
+          {/* Composer + footer live inside the same card as the transcript —
+              see .chat-column / .chat-composer. */}
+          <div className="chat-composer">
+            {error && <p className="error-text chat-error">{error}</p>}
 
-          <div className="quick-actions">
-            <button type="button" className="quick-action" onClick={clearCart} disabled={sending || !hasAddress}>
-              Clear cart
-            </button>
-          </div>
-
-          {pendingImage && (
-            <div className="pending-attachment">
-              <img src={pendingImage} alt="Screenshot to import" className="pending-attachment-thumb" />
-              <div className="pending-attachment-info">
-                <span className="pending-attachment-label">Ready to send</span>
-                <span className="pending-attachment-hint">
-                  Add a note below if you want (e.g. "only the snacks"), then hit Send.
-                </span>
+            {pendingImage && (
+              <div className="pending-attachment">
+                <img src={pendingImage} alt="Screenshot to import" className="pending-attachment-thumb" />
+                <div className="pending-attachment-info">
+                  <span className="pending-attachment-label">Ready to send</span>
+                  <span className="pending-attachment-hint">
+                    Add a note below if you want (e.g. "only the snacks"), then hit Send.
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className="pending-attachment-remove"
+                  onClick={() => setPendingImage(null)}
+                  disabled={sending}
+                  aria-label="Remove attached screenshot"
+                >
+                  ×
+                </button>
               </div>
+            )}
+
+            {/* One utility row: the cart shortcuts on the left, Reset pushed
+                to the right. Reset used to own a whole 44px footer strip of
+                its own below the composer — a lot of the chat card's height
+                for one small link. */}
+            <div className="quick-actions">
+              <button type="button" className="quick-action" onClick={clearCart} disabled={sending || !hasAddress}>
+                Clear cart
+              </button>
               <button
                 type="button"
-                className="pending-attachment-remove"
-                onClick={() => setPendingImage(null)}
-                disabled={sending}
-                aria-label="Remove attached screenshot"
+                className="quick-action"
+                onClick={reorderUsuals}
+                disabled={sending || !hasAddress || usuals.length === 0}
+                title={usuals.length === 0 ? "Save an item with ☆ first" : "Add every saved usual to the cart"}
               >
-                ×
+                Reorder usuals
+              </button>
+              {/* "conversation" is hidden under 820px so all three utility
+                  controls stay on one row on a phone instead of the reset
+                  wrapping to a second row and doubling this row's height.
+                  aria-label keeps the full wording for screen readers. */}
+              <button
+                className="link-button quick-actions-reset"
+                onClick={reset}
+                type="button"
+                disabled={sending || messages.length === 0}
+                aria-label="Reset conversation"
+              >
+                Reset<span className="quick-actions-reset-word"> conversation</span>
               </button>
             </div>
-          )}
 
-          <form onSubmit={onSubmit} className="chat-input-row">
-            <input ref={fileInputRef} type="file" accept="image/*" hidden onChange={onImageChosen} />
-            <button
-              type="button"
-              className="chat-attach-btn"
-              onClick={() => fileInputRef.current?.click()}
-              disabled={sending || !hasAddress}
-              title="Attach a screenshot of another app's cart"
-              aria-label="Attach a screenshot"
-            >
-              <PlusIcon />
-            </button>
-            <input
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              placeholder={
-                !hasAddress
-                  ? "Pick a delivery address first…"
-                  : pendingImage
-                    ? "Add a note (optional)…"
-                    : "What do you want to order?"
-              }
-              disabled={sending || !hasAddress}
-            />
-            <button type="submit" disabled={sending || !hasAddress}>
-              {sending ? "…" : "Send"}
-            </button>
-          </form>
-          <button className="link-button" onClick={reset} type="button">
-            Reset conversation
-          </button>
+            <form onSubmit={onSubmit} className="chat-input-row">
+              <input ref={fileInputRef} type="file" accept="image/*" hidden onChange={onImageChosen} />
+              <button
+                type="button"
+                className="chat-attach-btn"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={sending || !hasAddress}
+                title="Attach a screenshot of another app's cart"
+                aria-label="Attach a screenshot"
+              >
+                <PlusIcon />
+              </button>
+              <input
+                type="text"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                placeholder={
+                  !hasAddress
+                    ? "Pick a delivery address first…"
+                    : pendingImage
+                      ? "Add a note (optional)…"
+                      : "What do you want to order?"
+                }
+                disabled={sending || !hasAddress}
+              />
+              {/* Disabled unless there's something to send — an enabled Send
+                  with an empty box is a button that lies about what it does.
+                  A staged screenshot counts, since the note is optional. */}
+              <button
+                type="submit"
+                disabled={sending || !hasAddress || (!input.trim() && !pendingImage)}
+                aria-label="Send"
+                title="Send"
+              >
+                <SendIcon />
+              </button>
+            </form>
+          </div>
         </div>
 
         <div className="cart-column">
@@ -842,10 +925,14 @@ function ExplainModal({ product, onClose }) {
   const [question, setQuestion] = useState("");
   const [asking, setAsking] = useState(false);
   const [error, setError] = useState(null);
-  const bottomRef = useRef(null);
+  const threadRef = useRef(null);
 
+  // Same reasoning as the main transcript: scroll this element, not via a
+  // sentinel that would also move ancestors.
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    const el = threadRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
   }, [history, asking]);
 
   // Escape closes, and the page behind is scroll-locked while the dialog is
@@ -932,7 +1019,7 @@ function ExplainModal({ product, onClose }) {
           </button>
         </div>
 
-        <div className="explain-thread">
+        <div className="explain-thread" ref={threadRef}>
           {history.length === 0 && !asking && (
             <div className="explain-empty">
               <p className="explain-empty-title">Ask anything about this item</p>
@@ -981,7 +1068,6 @@ function ExplainModal({ product, onClose }) {
               <span className="explain-dot" />
             </div>
           )}
-          <div ref={bottomRef} />
         </div>
 
         {error && <p className="explain-error">{error}</p>}
