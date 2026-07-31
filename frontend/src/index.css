@@ -1541,6 +1541,17 @@ button:disabled {
   background: none;
 }
 
+/* The wrapper's own :focus-within ring above is the ONE focus indicator for
+   this whole control — without this, the input's sharp-cornered
+   :focus-visible outline (global rule) and the round Send button's own
+   outline both drew on top of it at the same time: a rectangle hugging the
+   text field plus what read as a second circle around Send, stacked on the
+   pill's rounded ring. */
+.chat-input-row input:focus-visible,
+.chat-input-row button:focus-visible {
+  outline: none;
+}
+
 /* Send: a circular icon button, matching the attach button's geometry on the
    other end of the pill so the row is visually symmetrical. */
 .chat-input-row button[type="submit"] {
@@ -2158,6 +2169,13 @@ button:disabled {
 .explain-input-row input:focus {
   border: none;
   box-shadow: none;
+}
+
+/* Same reasoning as the main composer: the wrapper's :focus-within ring is
+   the only indicator needed, so suppress the input/button's own outline. */
+.explain-input-row input:focus-visible,
+.explain-input-row button:focus-visible {
+  outline: none;
 }
 
 .explain-input-row button {
