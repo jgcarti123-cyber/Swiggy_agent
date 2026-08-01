@@ -1603,6 +1603,7 @@ button:disabled {
   border-bottom: 1px solid var(--border);
 }
 
+
 /* Cart lines animate in so an item landing from the chat is noticeable in the
    rail — otherwise the cart silently changes while the user's eye is elsewhere. */
 .cart-item {

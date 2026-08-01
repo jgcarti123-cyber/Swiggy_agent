@@ -34,10 +34,16 @@ instamartRouter.get("/addresses", async (req, res) => {
   res.json(await instamartClient.getAddresses({ page, pageSize }));
 });
 
+// Read-only cart view. This is what the Cart panel polls every 12s, so it
+// must be exactly that — a READ. `allowStuckCartRecovery: false` forbids the
+// clear-and-retry self-heal inside getCartOrEmpty here: a background refresh
+// that can silently wipe a real cart is far worse than briefly showing an
+// error. The recovery still runs on the paths the user actually triggers
+// (add / swap / clear), which is where it belongs.
 instamartRouter.get("/cart", async (req, res) => {
   // getCartOrEmpty so a "no cart yet" state renders as an empty cart in the UI
   // instead of a 502 tool error.
-  res.json(await instamartClient.getCartOrEmpty());
+  res.json(await instamartClient.getCartOrEmpty({ allowStuckCartRecovery: false }));
 });
 
 instamartRouter.get("/chat/history", (req, res) => {

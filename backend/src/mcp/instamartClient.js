@@ -45,6 +45,28 @@ async function callWithRetry(name, args, { retries = 1, delayMs = 700 } = {}) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Which address does a cart action actually use? — the account's ONE
+// Instamart cart has a `selectedAddressId` field that both this app and the
+// real Swiggy phone app can set, and whichever one wrote it last wins until
+// someone writes it again. `get_cart`/`clear_cart` take no address parameter
+// at all (verified against their live reference docs) — they just report/
+// clear whatever is currently active. `update_cart`'s `selectedAddressId`
+// genuinely does set it, confirmed live by switching it back and forth and
+// watching `get_cart`'s response follow every time.
+//
+// The policy this app follows (the user's explicit choice): its own saved
+// address always wins. Concretely, that means every `updateCart` call must
+// pass the app's saved addressId — never the phone's last-set one — so each
+// write this app performs leaves the cart on the intended address regardless
+// of what happened in between. An earlier version of this file tried to be
+// "smart" here by tracking and re-asserting whatever address a previous read
+// had seen — which did the opposite: it made every write follow the phone
+// instead of the app's own choice, which is exactly what let the address
+// drift away in the first place. Removed; every caller already threads its
+// own addressId through (from the local `saved_address` DB row via
+// `requireSavedAddress` in routes/instamart.js) and that's the only address
+// that should ever reach `update_cart`.
 export const instamartClient = {
   getAddresses: ({ page = 1, pageSize = 10 } = {}) => call("get_addresses", { page, pageSize }),
 
@@ -52,8 +74,10 @@ export const instamartClient = {
     call("search_products", { addressId, query, offset }),
 
   // Replaces the ENTIRE cart — never additive. Callers must get_cart first,
-  // merge, then send the full item list back.
-  updateCart: ({ selectedAddressId, items }) => callWithRetry("update_cart", { selectedAddressId, items }),
+  // merge, then send the full item list back, with the app's own saved
+  // addressId (see above) — passed straight through, never overridden.
+  updateCart: ({ selectedAddressId, items }) =>
+    callWithRetry("update_cart", { selectedAddressId, items }),
 
   getCart: () => call("get_cart", {}),
 
@@ -63,14 +87,24 @@ export const instamartClient = {
   // auto-recovery attempt — clear, then re-read — so the Cart panel self-
   // heals instead of showing a dead-end error until some unrelated cart
   // write happens to fix it. Any other error still propagates untouched.
-  getCartOrEmpty: async () => {
+  getCartOrEmpty: async ({ allowStuckCartRecovery = true } = {}) => {
     try {
       return await call("get_cart", {});
     } catch (err) {
       if (err instanceof SwiggyToolError && EMPTY_CART_MESSAGE.test(err.message)) {
         return { items: [], empty: true };
       }
+      // The recovery below CLEARS THE CART. That is acceptable as a
+      // last-resort self-heal on a path the user explicitly triggered (an
+      // add, a swap, a clear) — it is NOT acceptable on a passive read.
+      // `allowStuckCartRecovery: false` exists because the cart panel polls
+      // this every 12s: a background refresh that can wipe a real cart, with
+      // no user action and nothing on screen, is far worse than showing a
+      // stale/error cart for a few seconds. Reported live as "nothing new is
+      // getting added" — items were landing, then being erased by the very
+      // next poll.
       if (err instanceof SwiggyToolError && STUCK_CART_MESSAGE.test(err.message)) {
+        if (!allowStuckCartRecovery) throw err;
         await call("clear_cart", {}).catch(() => {});
         try {
           return await call("get_cart", {});

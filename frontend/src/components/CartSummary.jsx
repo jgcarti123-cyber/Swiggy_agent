@@ -33,6 +33,14 @@ function normalizeCart(cart) {
   };
 }
 
+// A second, separate address line was tried here (showing whatever address
+// Swiggy's own get_cart reported) to catch this app's saved address drifting
+// away from the account's actual selected one. Removed now that the real fix
+// landed one layer down: every cart-touching call re-asserts this app's own
+// saved address on the write itself (see instamartClient.js's updateCart doc
+// comment), so the two can no longer disagree after any action this app
+// performs — a second address line would just be redundant with the "Delivering
+// to:" header above, not a safety net.
 function EmptyCart({ label = "Your cart is empty" }) {
   return (
     <div className="cart-summary">
