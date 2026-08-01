@@ -7,16 +7,41 @@ class ApiError extends Error {
 }
 
 async function request(path, options = {}) {
-  const res = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
-    ...options,
-  });
+  let res;
+  try {
+    res = await fetch(path, {
+      headers: { "Content-Type": "application/json" },
+      ...options,
+    });
+  } catch {
+    // fetch() itself throws for a genuine network-level failure — rare in
+    // this app's setup (the frontend only ever calls same-origin /api paths,
+    // proxied by Vite), but a real possibility outside dev (e.g. a build
+    // hitting a different origin directly). Kept as a fallback alongside the
+    // 502 case below, which is what an actually-down backend looks like here.
+    throw new ApiError("Can't reach the backend — make sure it's running (npm run dev in the backend folder), then try again.", {
+      status: 0,
+    });
+  }
   const body = await res.json().catch(() => null);
   if (!res.ok) {
     if (res.status === 401 || body?.error === "NEEDS_REAUTH") {
       throw new ApiError(body?.message || "Please re-authenticate with Swiggy", {
         status: 401,
         body,
+      });
+    }
+    // The actual failure mode confirmed live: Vite's dev proxy returns a
+    // plain 502 with a non-JSON body (so `body` is null here) when it can't
+    // reach the backend on :8787 — the browser DID successfully reach Vite on
+    // :5173, so fetch() itself never throws; this is what a down backend
+    // looks like from here. Without this check, a "Clear cart" click while
+    // the backend was down failed with the generic message below and no hint
+    // of why — the click never even reached Swiggy, so the phone app's cart
+    // correctly never changed, but nothing on screen explained that.
+    if (body === null && [502, 503, 504].includes(res.status)) {
+      throw new ApiError("Can't reach the backend — make sure it's running (npm run dev in the backend folder), then try again.", {
+        status: res.status,
       });
     }
     throw new ApiError(body?.message || `Request to ${path} failed`, { status: res.status, body });
