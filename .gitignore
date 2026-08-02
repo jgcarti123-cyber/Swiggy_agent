@@ -36,3 +36,6 @@ CabinetGrotesk_Complete/
 
 # Temporary cart diagnostic (see backend/src/cartAudit.js)
 backend/data/cart-audit.log
+
+# Local scratch notes (dev-server start commands)
+note.txt

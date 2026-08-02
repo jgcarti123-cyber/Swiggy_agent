@@ -63,15 +63,7 @@ function money(value) {
 // onCartUpdate lets the stepper push a fresh cart up to the parent after a
 // mutation, without going through the chat pipeline — a +/- click is a plain
 // cart edit, not a chat event (see setItemQuantity on the backend).
-//
-// onMutate wraps that write in the parent's cart mutation guard. It matters
-// here more than anywhere else: because this path deliberately skips the chat
-// pipeline, it also skipped the `sending` flag the cart poller used to check,
-// leaving the stepper completely unprotected — a background read in flight
-// during the write would land afterwards and repaint the old quantity, which
-// read as the change silently reverting a few seconds later. Defaulted so the
-// component still works standalone, but InstamartChat always passes it.
-export function CartSummary({ cart, onCartUpdate, onMutate = (fn) => fn() }) {
+export function CartSummary({ cart, onCartUpdate }) {
   const [pendingKey, setPendingKey] = useState(null);
   const [itemError, setItemError] = useState(null); // { key, message } | null
 
@@ -81,9 +73,7 @@ export function CartSummary({ cart, onCartUpdate, onMutate = (fn) => fn() }) {
     setPendingKey(key);
     setItemError(null);
     try {
-      const result = await onMutate(() =>
-        api.instamartSetQuantity(item.spinId, item.skuId, item.quantity + delta)
-      );
+      const result = await api.instamartSetQuantity(item.spinId, item.skuId, item.quantity + delta);
       if (result.error) setItemError({ key, message: result.error });
       if (result.cart) onCartUpdate?.(result.cart);
     } catch (err) {

@@ -116,15 +116,17 @@ function downscaleImage(file, maxEdge = 1600, quality = 0.82) {
 // "Almost there…" restarting as "Thinking…" reads like a hang).
 const THINKING_LINES = ["Thinking…", "Searching Instamart…", "Checking prices…", "Sorting the good stuff…", "Almost there…"];
 
-// How long after a cart mutation finishes before background polling is allowed
-// to speak again. Purely a settle margin for Swiggy's own eventual consistency
-// (a get_cart moments after a write can still report the pre-write state — see
-// mergeAndUpdateCart's note in instamartAgent.js); the generation guard below
-// is what actually prevents the stale-overwrite bug. Comfortably inside the
-// 12s poll interval, so this costs at most one skipped tick.
-const CART_SETTLE_MS = 4000;
-
-export function InstamartChat({ isActive = true }) {
+// The cart panel deliberately does NOT poll. Background polling was tried and
+// removed: the cart is shared live with the real Swiggy phone app, so a poll
+// surfaced every external edit as an unexplained flip mid-session, and a read
+// in flight during a local write could repaint stale state over a fresh one.
+// The generation-counter guard that fixed the race was itself more machinery
+// than the feature earned. The cart now refreshes exactly when this app
+// changes it (every action's response carries the fresh cart) and on load —
+// which is what a single-user local dashboard actually needs. If it's ever
+// reconsidered, read ARCHITECTURE.md §6.17 first: the failure modes are
+// documented in full, and none of them were cheap to find.
+export function InstamartChat() {
   const [hasAddress, setHasAddress] = useState(false);
   const [messages, setMessages] = useState([]);
   const [cart, setCart] = useState(null);
@@ -138,69 +140,11 @@ export function InstamartChat({ isActive = true }) {
   const [reauthError, setReauthError] = useState(null);
   const scrollRef = useRef(null);
   const fileInputRef = useRef(null);
-  // Read by the polling effect below without needing `sending` in its
-  // dependency array — that would tear down and restart the interval on
-  // every send, which is harmless but pointless churn.
-  const sendingRef = useRef(false);
-  useEffect(() => {
-    sendingRef.current = sending;
-  }, [sending]);
-
-  // --- Cart mutation guard -------------------------------------------------
-  // Background polling used to clobber the result of an action the user had
-  // just taken, which looked exactly like the cart "undoing itself" a few
-  // seconds later — reproduced live: clear the cart, watch it go empty, watch
-  // the item reappear 2s later, while the very next server read confirmed the
-  // cart really was empty. The item was never on the server; it came from a
-  // GET /cart that had been issued BEFORE the clear and only resolved after
-  // it, overwriting the fresh state with its stale snapshot.
-  //
-  // `sendingRef` alone couldn't stop this: it's checked when a poll STARTS, so
-  // it only skips polls that begin during an action — it says nothing about a
-  // read already in flight when the action begins. And whether that read wins
-  // is pure luck: measured live, cart reads take 0.34-1.2s and a clear-cart
-  // write takes 0.9-1.0s, so the two distributions overlap outright. The
-  // quantity stepper had no guard at all (it calls the API directly, outside
-  // runAction, so `sending` never even flips), which is why quantity changes
-  // were the most reliable to revert.
-  //
-  // Fix: a generation counter bumped at both ends of every cart mutation. A
-  // poll records the generation when it starts and throws its own result away
-  // if that generation has moved on — i.e. the data it's holding is provably
-  // older than something the user did. Plus a short settle window afterwards
-  // for Swiggy's own eventual consistency.
-  const cartGenRef = useRef(0);
-  const cartMutatingRef = useRef(0);
-  const cartSettleUntilRef = useRef(0);
-
-  // Wrap anything that can change the cart. Every caller must go through this
-  // — including the ones that bypass runAction (the cart stepper, recipe
-  // swaps), since those are exactly the paths that were unprotected.
-  async function withCartMutation(fn) {
-    cartGenRef.current += 1;
-    cartMutatingRef.current += 1;
-    try {
-      return await fn();
-    } finally {
-      cartMutatingRef.current -= 1;
-      cartGenRef.current += 1;
-      cartSettleUntilRef.current = Date.now() + CART_SETTLE_MS;
-    }
-  }
-
-  // Reads refs only, so it always sees current values even from the closure
-  // the polling effect captured on an earlier render.
-  function cartPollBlocked() {
-    return cartMutatingRef.current > 0 || Date.now() < cartSettleUntilRef.current;
-  }
 
   // --- Diagnostic: every cart the panel actually renders ---------------------
-  // Two rounds of provably-correct fixes haven't made the reported symptom go
-  // away, and the server-side logs have consistently shown the server being
-  // right — which means the disagreement is here, in what gets rendered. So
-  // every single write to `cart` state goes through this one function, tagged
-  // with where it came from, and is mirrored into the backend's audit log so
-  // the client and server halves share one timeline. No-op unless CART_AUDIT=1
+  // Every write to `cart` state goes through this one function, tagged with
+  // where it came from, and is mirrored into the backend's audit log so the
+  // client and server halves share one timeline. No-op unless CART_AUDIT=1
   // server-side. Route ALL cart updates through this, never bare setCart —
   // an unlogged path is precisely the blind spot this is meant to remove.
   function applyCart(source, next) {
@@ -237,76 +181,6 @@ export function InstamartChat({ isActive = true }) {
     api.instamartUsualsSchedule().then((s) => setSchedule(s)).catch(() => {});
   }, []);
 
-  // Background cart polling. get_cart already reflects anything added from
-  // OUTSIDE this app (e.g. the real Instamart phone app) — Swiggy's cart is
-  // the single source of truth, there's no local mirror to go stale. The
-  // actual gap was that this frontend only ever re-fetched it after ITS OWN
-  // mutations, so an external change wouldn't show up here until the next
-  // local action or a full reload. Polling closes that gap.
-  //
-  // Scoped to when it's actually useful: only while this panel is the one
-  // visible (`isActive`, passed down from App.jsx's tab state) and the
-  // browser tab itself has focus (`document.hidden`) — no point spending
-  // calls refreshing a cart nobody's looking at.
-  //
-  // A poll is skipped outright while an action is in flight, and — critically
-  // — a poll that has ALREADY STARTED discards its own result if the cart
-  // generation moved while it was waiting. Never trust arrival order here:
-  // the whole bug this guards against was a slow read landing after a fast
-  // write and winning by virtue of being last. See the cart mutation guard
-  // above for the measured latencies that make that a coin flip, not an edge
-  // case.
-  useEffect(() => {
-    if (!isActive || !hasAddress) return undefined;
-
-    let cancelled = false;
-
-    async function poll() {
-      if (document.hidden || sendingRef.current || cartPollBlocked()) {
-        api.instamartAudit("poll:skipped", {
-          hidden: document.hidden,
-          sending: sendingRef.current,
-          blocked: cartPollBlocked(),
-        });
-        return;
-      }
-      const gen = cartGenRef.current;
-      try {
-        const c = await api.instamartCart();
-        // Anything the user did while this read was in flight is newer than
-        // what it's holding — drop it rather than repaint the cart backwards.
-        // The action's own response already set the fresh cart.
-        if (!cancelled && gen === cartGenRef.current && !cartPollBlocked()) {
-          applyCart("poll", c);
-        } else {
-          // Logged too: if the guard is firing when it shouldn't (or never
-          // firing when it should), that's visible here rather than inferred.
-          api.instamartAudit("poll:discarded", {
-            cancelled,
-            genAtStart: gen,
-            genNow: cartGenRef.current,
-            blocked: cartPollBlocked(),
-            wouldHaveRendered: (c?.items || []).map((i) => ({ name: i.itemName, qty: i.quantity })),
-          });
-        }
-      } catch (err) {
-        // A background refresh failing shouldn't clobber an already-good,
-        // already-displayed cart with an error state — that would read as
-        // the cart "breaking" every ~12s on any transient hiccup. The one
-        // exception is a genuinely expired token: that's real and actionable
-        // regardless of what triggered the check.
-        if (!cancelled && isReauthError(err)) setReauthError(err.message);
-      }
-    }
-
-    poll(); // refresh immediately on becoming the active panel, not after a full interval
-    const id = setInterval(poll, 12000);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
-  }, [isActive, hasAddress]);
-
   // Scroll the transcript container itself, NOT via scrollIntoView on a
   // sentinel: scrollIntoView walks every scrollable ancestor, so with the chat
   // card now sized to the viewport it dragged the whole page down on each new
@@ -330,10 +204,7 @@ export function InstamartChat({ isActive = true }) {
     setMessages((prev) => [...prev, { role: "user", text: displayText, ...userExtra }]);
     setSending(true);
     try {
-      // Every action routed through here can end up changing the cart (an
-      // add, a clear, a reorder, a recipe/import confirm, or a free-text chat
-      // message that edits it), so all of them hold the cart mutation guard.
-      const result = await withCartMutation(apiCall);
+      const result = await apiCall();
       setMessages((prev) => {
         const next = [...prev, assistantMessageFromResult(result)];
         // A real add attempt just proved this spinId can't actually be added
@@ -451,19 +322,14 @@ export function InstamartChat({ isActive = true }) {
     setError(null);
     try {
       const prevAdded = group.addedSpinId ? group.options.find((o) => o.spinId === group.addedSpinId) : null;
-      // Guarded like every other cart write — this one bypasses runAction (it
-      // deliberately produces no chat bubble), so it needs the guard applied
-      // directly or a background poll can undo the swap.
-      const res = await withCartMutation(() =>
-        api.instamartRecipeSwap({
-          ingredient: group.ingredient,
-          removeSpinId: prevAdded?.spinId,
-          removeSkuId: prevAdded?.skuId,
-          spinId: option.spinId,
-          skuId: option.skuId,
-          quantity: group.quantity, // undefined for recipes (server defaults to 1)
-        })
-      );
+      const res = await api.instamartRecipeSwap({
+        ingredient: group.ingredient,
+        removeSpinId: prevAdded?.spinId,
+        removeSkuId: prevAdded?.skuId,
+        spinId: option.spinId,
+        skuId: option.skuId,
+        quantity: group.quantity, // undefined for recipes (server defaults to 1)
+      });
       if (res.error) setError(res.error);
       if (res.cart) applyCart("recipe-swap", res.cart);
       if (res.addedSpinId) {
@@ -704,15 +570,7 @@ export function InstamartChat({ isActive = true }) {
         </div>
 
         <div className="cart-column">
-          {/* onMutate is not optional in practice: the +/- stepper is a cart
-              write that never goes through runAction, so without it a poll can
-              revert a quantity change (the most reproducible form of this bug
-              — see the cart mutation guard above). */}
-          <CartSummary
-            cart={cart}
-            onCartUpdate={(c) => applyCart("stepper", c)}
-            onMutate={withCartMutation}
-          />
+          <CartSummary cart={cart} onCartUpdate={(c) => applyCart("stepper", c)} />
           <UsualsPanel
             usuals={usuals}
             schedule={schedule}

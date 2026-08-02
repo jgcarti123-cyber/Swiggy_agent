@@ -22,7 +22,7 @@ function App() {
               <DishCompare />
             </div>
             <div className="feature-pane" hidden={active !== "insta-nt"}>
-              <InstamartChat isActive={active === "insta-nt"} />
+              <InstamartChat />
             </div>
           </main>
         </AuthGate>
