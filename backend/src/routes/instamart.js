@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { instamartClient } from "../mcp/instamartClient.js";
+import { cartAuditMiddleware, logEvent } from "../cartAudit.js";
 import {
   getSavedAddress,
   getUsualsSchedule,
@@ -28,6 +29,19 @@ import {
 
 export const instamartRouter = Router();
 
+// Diagnostic only, and a no-op unless CART_AUDIT=1 (see cartAudit.js).
+instamartRouter.use(cartAuditMiddleware);
+
+// The browser posts what it actually RENDERED here, so the audit file contains
+// both halves of the story in one timeline: what Swiggy returned, and what the
+// user was looking at when they said it was wrong. Without this the log can
+// only ever show the server's view, which in this bug has repeatedly been the
+// correct one — the disagreement is on the client.
+instamartRouter.post("/_audit", (req, res) => {
+  logEvent("client", { event: req.body?.event, detail: req.body?.detail ?? null });
+  res.json({ ok: true });
+});
+
 instamartRouter.get("/addresses", async (req, res) => {
   const page = Number(req.query.page || 1);
   const pageSize = Number(req.query.pageSize || 10);
@@ -41,6 +55,11 @@ instamartRouter.get("/addresses", async (req, res) => {
 // error. The recovery still runs on the paths the user actually triggers
 // (add / swap / clear), which is where it belongs.
 instamartRouter.get("/cart", async (req, res) => {
+  // Express sends an ETag for every JSON response, which is fine for a page
+  // load and pointless for a live-polled endpoint — a cart is never cacheable
+  // by definition, and a revalidated stale body is the one thing this panel
+  // must never render.
+  res.set("Cache-Control", "no-store");
   // getCartOrEmpty so a "no cart yet" state renders as an empty cart in the UI
   // instead of a 502 tool error.
   res.json(await instamartClient.getCartOrEmpty({ allowStuckCartRecovery: false }));

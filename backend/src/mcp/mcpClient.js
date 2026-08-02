@@ -1,6 +1,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { getValidAccessToken, NeedsReauthError } from "../auth/oauthClient.js";
+import { auditEnabled, logEvent, summarizeCart } from "../cartAudit.js";
 
 // One cached, connected MCP client per server URL, keyed alongside the token
 // it was built with — reconnected transparently when the token changes
@@ -99,7 +100,28 @@ function extractResult(result, toolName) {
 // just repeats the same failure.
 const NETWORK_ERROR_PATTERN = /fetch failed|ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|network error|ETIMEDOUT/i;
 
+// Cart tools only — a search or a go-to-items fetch is noise here, and their
+// responses are huge.
+const AUDITED_TOOLS = new Set(["get_cart", "update_cart", "clear_cart"]);
+
 export async function callSwiggyTool(serverUrl, name, args) {
+  // Logged HERE, at the one chokepoint every Swiggy call already passes
+  // through, so no cart write can escape the audit by taking some path a
+  // hand-placed log line didn't anticipate — which is exactly the kind of
+  // blind spot this whole investigation keeps running into.
+  const audit = auditEnabled && AUDITED_TOOLS.has(name);
+  const startedAt = Date.now();
+  if (audit) {
+    logEvent("swiggy:call", {
+      tool: name,
+      // update_cart's items ARE the interesting part (it replaces the whole
+      // cart, so what's missing from this list is what gets destroyed).
+      items: Array.isArray(args?.items)
+        ? args.items.map((i) => ({ spinId: i.spinId, skuId: i.skuId, qty: i.quantity }))
+        : undefined,
+      selectedAddressId: args?.selectedAddressId,
+    });
+  }
   try {
     // getClient() is INSIDE the try, not before it: it isn't just a cache
     // lookup — on a cache miss it does the actual MCP handshake
@@ -112,8 +134,19 @@ export async function callSwiggyTool(serverUrl, name, args) {
     // happened before this function's own try block used to start.
     const client = await getClient(serverUrl);
     const result = await client.callTool({ name, arguments: args });
-    return extractResult(result, name);
+    const extracted = extractResult(result, name);
+    if (audit) {
+      logEvent("swiggy:ok", { tool: name, durMs: Date.now() - startedAt, cart: summarizeCart(extracted) });
+    }
+    return extracted;
   } catch (err) {
+    if (audit) {
+      logEvent("swiggy:err", {
+        tool: name,
+        durMs: Date.now() - startedAt,
+        message: String(err?.message || err).split("\n")[0].slice(0, 300),
+      });
+    }
     // A 401 mid-session means the token was revoked/expired server-side; a
     // network-level failure means the cached connection is broken. Either
     // way, drop it so the next call (including instamartClient's retry)

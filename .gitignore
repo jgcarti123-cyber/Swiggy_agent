@@ -33,3 +33,6 @@ npm-debug.log*
 # ~1.9MB). The app loads exactly one file from it — the variable woff2 — which
 # is committed at frontend/public/fonts/ alongside the FFL license.
 CabinetGrotesk_Complete/
+
+# Temporary cart diagnostic (see backend/src/cartAudit.js)
+backend/data/cart-audit.log

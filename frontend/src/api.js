@@ -78,6 +78,14 @@ export const api = {
   clearFoodCart: () => request("/api/food/cart/clear", { method: "POST" }),
 
   instamartCart: () => request("/api/instamart/cart"),
+
+  // Diagnostic sink — posts what the UI actually rendered into the backend's
+  // cart audit log so both halves share one timeline (see cartAudit.js).
+  // Fire-and-forget and always swallowed: a diagnostic must never surface as
+  // an error in the thing it's diagnosing. No-op server-side unless
+  // CART_AUDIT=1.
+  instamartAudit: (event, detail) =>
+    request("/api/instamart/_audit", { method: "POST", body: JSON.stringify({ event, detail }) }).catch(() => {}),
   instamartChatHistory: () => request("/api/instamart/chat/history"),
   instamartChatSend: (message) =>
     request("/api/instamart/chat", { method: "POST", body: JSON.stringify({ message }) }),

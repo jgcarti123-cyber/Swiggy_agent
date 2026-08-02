@@ -41,7 +41,7 @@ const SYSTEM_PROMPT = `You are Insta-nt, a grocery assistant for Swiggy Instamar
 
 - SCOPE — this is a hard rule. You help the user SHOP on Swiggy Instamart, which is a general quick-commerce store: groceries and fresh produce, but ALSO household supplies, personal & baby care, apparel and innerwear (underwear, socks, vests…), stationery, electronics/accessories, pet supplies, and more. If it's a product someone could plausibly buy on Instamart, treat it as in scope and search for it — do NOT refuse it just because it isn't food. What you must NOT do is answer questions unrelated to shopping: general knowledge, trivia, capitals, math, coding, translation, current events, chit-chat, advice, or any other topic — do NOT answer those even if you know the answer. For an off-topic (non-shopping) request, reply with exactly one short sentence redirecting them (e.g. "I can only help you shop on Instamart — try \\"add milk\\" or \\"order things for biryani\\".") and nothing else. Never call a tool for an off-topic request.
 - To find or add a product, call search_products with the best search term for what the user described (e.g. "milk", "chocolate cookies", "amul milk"). If they state a pack size or weight (e.g. "100g paneer", "1kg rice", "2 pieces chicken"), keep it in the query exactly as they said it — the app uses it to filter results to that exact size. The app automatically shows the user a brand choice or product cards right after your search — you never need to ask which brand or list results yourself, just search.
-- For anything that isn't a fresh product search — removing an item, changing a quantity, clearing part of the cart, checking out — call get_cart first to see what's actually there, then update_cart with the full merged item list. You MUST actually call update_cart to make a change; never say you changed the cart without calling it.
+- For anything that isn't a fresh product search — removing an item, changing a quantity, clearing part of the cart, checking out — call get_cart first to see what's actually there, then update_cart with the full merged item list. You MUST actually call update_cart to make a change; never say you changed the cart without calling it. If update_cart's result includes "itemsNotAdded", Swiggy rejected those specific items even though the call itself succeeded — say so honestly (e.g. "added 3 of 4 — couldn't add X, try again in a bit") rather than reporting a blanket success.
 - Never call checkout unless the user has explicitly confirmed in this chat. For Cash on Delivery, confirm first then paymentMethod="Cash"; for UPI, call get_payment_options first.
 - The user has a personal "usuals" list (a saved reorder list). To LIST it, call get_usuals. To REMOVE something from it, call remove_from_usuals with the item name. To ADD something to it, just search_products for the item — every product card has a star (☆) the user taps to save it, so you don't add to usuals yourself; find the item and let them save it.
 - If the user asks for everything needed to MAKE or COOK a dish/meal ("order things for biryani", "I want to make pasta"), call propose_ingredients with the dish name and its essential ingredient list. This must be the authentic INDIAN home-cooking version of the dish — for a dish that also has an international/Western version (e.g. "pasta", "sandwich", "salad"), give the ingredients as an Indian kitchen would actually make it, not a generic Western default. Each ingredient must be a short, generic Instamart search term (e.g. "basmati rice", "curd", "mint leaves") — no brands, no quantities, no steps. Keep it minimal: only what the dish genuinely needs. Use the COMMON INDIAN GROCERY NAME for each staple, because that's what an Indian quick-commerce catalogue stocks: "curd" (NOT "yogurt" — that surfaces sweetened Greek/flavoured tubs), "coriander leaves" (NOT "cilantro"), "capsicum" (NOT "bell pepper"), "paneer" (NOT "cottage cheese"), "chana"/"rajma" for the pulse rather than "garbanzo"/"kidney bean marketing names", "green chilli" (NOT "jalapeño"), "besan" (NOT "gram flour"), "rava"/"sooji" (NOT "semolina"), "hing" (NOT "asafoetida"). The app shows the user the list to edit and confirm — do not search for the items yourself. This list is only a fallback — a real web search grounds it in an actual Indian recipe right after (see below), so don't worry about being exhaustive here.
@@ -304,17 +304,55 @@ function distinctBrands(raw) {
 // re-checking brand count on those results would wrongly ask again.
 // `goToIndex`, when passed, tags each variant with the user's own go-to-items
 // rank (see §"most ordered" below) so sortVariants can promote it.
+//
+// DEDUPED BY spinId, because Swiggy's search genuinely returns the same
+// product more than once in `products[]`. Confirmed live against the real
+// catalogue: a "SuperYou protein bar" search returned 20 products / 38
+// variants that collapse to only **24 distinct spinIds** — product#0 and
+// product#7 were both "SuperYou 10g Protein Wafer Bar" with byte-identical
+// variations. "banana" and "milk" had zero duplicates, so this is per-query,
+// not a constant.
+//
+// Note what the duplicates are NOT: they are not two variants sharing a
+// spinId. Both copies carry the SAME skuId too (24 distinct spinIds, 24
+// distinct spinId+skuId pairs for that same search), so a composite key
+// distinguishes nothing here — the entries are identical in every field.
+// That's why this is deduped at the source rather than papered over further
+// downstream: undeduped, the same product rendered as several identical
+// product cards, "show more" paged through repeats instead of new options,
+// and the recipe/import "top 3 options" could spend all three slots on one
+// product. (It also produced a stream of React duplicate-key errors, which
+// was the symptom that surfaced it.)
+//
+// First occurrence wins, so Swiggy's own relevance ordering is preserved.
 function flattenVariants(raw, goToIndex) {
   const products = Array.isArray(raw?.products) ? raw.products : [];
   const out = [];
+  const bySpin = new Map();
   for (const p of products) {
     const brand = p.brand || p.variations?.[0]?.brandName || null;
     for (const v of p.variations || []) {
       if (!v.spinId) continue;
+      const spinId = String(v.spinId);
       const displayName = v.displayName || p.displayName || null;
       const rank = goToIndex ? goToRankFor(v, brand, displayName, goToIndex) : undefined;
-      out.push({
-        spinId: String(v.spinId),
+
+      const seen = bySpin.get(spinId);
+      if (seen) {
+        // Keep the first copy's position, but don't let a duplicate listing
+        // cost the "most ordered by you" badge: the two copies are grouped
+        // under different product entries, so `brand`/`displayName` (and
+        // therefore goToRankFor's fallback brand+name match) can differ
+        // between them even when the variant itself is identical.
+        if (rank !== undefined && (seen.orderRank === undefined || rank < seen.orderRank)) {
+          seen.mostOrdered = true;
+          seen.orderRank = rank;
+        }
+        continue;
+      }
+
+      const entry = {
+        spinId,
         skuId: v.skuId ? String(v.skuId) : null,
         brand: v.brandName || brand,
         displayName,
@@ -323,7 +361,9 @@ function flattenVariants(raw, goToIndex) {
         quantityDescription: v.quantityDescription || null,
         mostOrdered: rank !== undefined,
         orderRank: rank,
-      });
+      };
+      bySpin.set(spinId, entry);
+      out.push(entry);
     }
   }
   return out;
@@ -1327,10 +1367,68 @@ function makeExecuteTool(addressId) {
         if (!Array.isArray(args.items) || args.items.length === 0) {
           return compactCartForModel(await instamartClient.clearCart().then(() => instamartClient.getCartOrEmpty()));
         }
-        return compactCartForModel(await instamartClient.updateCart({ selectedAddressId: addressId, items: args.items }));
+
+        // NEVER trust the model's own skuId, and NEVER trust a non-throwing
+        // call as proof anything landed — this path had neither, unlike every
+        // deterministic action in this file, and it was reproduced live
+        // silently dropping a real item. Root cause: get_usuals didn't return
+        // skuId (fixed above), so a free-text "add my usuals to the cart"
+        // left the model filling that required field with the spinId itself.
+        // Swiggy tolerated that for 2 of 3 items (self-corrected from spinId)
+        // and silently omitted the third from the resulting cart — no error,
+        // no clue anywhere that it hadn't worked.
+        //
+        // Same two disciplines as mergeAndUpdateCart/addItemDirect elsewhere
+        // in this file:
+        //   1. For a spinId already in the live cart, use ITS skuId, not
+        //      whatever the model supplied — the model has no reliable way
+        //      to know the current one for an item it didn't just read this
+        //      turn (confirmed drift: the same spinId can resolve to a
+        //      different skuId at different times).
+        //   2. Verify what actually landed; resend the identical target once
+        //      if something's missing (never recompute on retry — resending
+        //      a fresh merge is the documented route to doubling a quantity),
+        //      then report anything still missing back to the model instead
+        //      of swallowing it, so its reply to the user can say "added 3 of
+        //      4" instead of a blanket success built from "didn't throw."
+        const current = await instamartClient.getCartOrEmpty();
+        const settledSkuId = new Map((current.items || []).map((i) => [itemKey(i.spinId), i.skuId]));
+        const items = args.items.map((it) => ({
+          spinId: it.spinId,
+          skuId: settledSkuId.get(itemKey(it.spinId)) ?? it.skuId,
+          quantity: it.quantity,
+        }));
+
+        await instamartClient.updateCart({ selectedAddressId: addressId, items });
+        let cart = await instamartClient.getCartOrEmpty();
+        const wanted = items.filter((it) => it.quantity > 0);
+        let missing = wanted.filter((it) => !keysInCart(cart).has(itemKey(it.spinId)));
+
+        if (missing.length > 0) {
+          await instamartClient.updateCart({ selectedAddressId: addressId, items });
+          cart = await instamartClient.getCartOrEmpty();
+          missing = wanted.filter((it) => !keysInCart(cart).has(itemKey(it.spinId)));
+        }
+
+        const result = compactCartForModel(cart);
+        if (missing.length > 0) result.itemsNotAdded = missing.map((it) => it.spinId);
+        return result;
       }
-      case "clear_cart":
-        return instamartClient.clearCart();
+      case "clear_cart": {
+        // Same gap as update_cart above, same fix: never trust a non-throwing
+        // call as proof — this returned Swiggy's raw response with no
+        // verification, unlike clearCartDirect (the button path), which
+        // already checks the cart is actually empty afterward. clear_cart is
+        // idempotent, so one re-clear costs nothing if the first attempt
+        // genuinely worked and the read was just early.
+        await instamartClient.clearCart();
+        let cart = await instamartClient.getCartOrEmpty();
+        if ((cart.items || []).length > 0) {
+          await instamartClient.clearCart();
+          cart = await instamartClient.getCartOrEmpty();
+        }
+        return compactCartForModel(cart);
+      }
       case "propose_ingredients": {
         // The model's first-pass list is now only a FALLBACK — see the
         // web-grounding block above. Showing the (possibly grounded) list for
@@ -1364,9 +1462,20 @@ function makeExecuteTool(addressId) {
         return { __endLoop: true, kind: "ingredients", payload: { dish, ingredients, grounded, sourceUrls } };
       }
       case "get_usuals":
+        // skuId was missing here — reproduced live, and it wasn't a harmless
+        // omission: update_cart's schema REQUIRES skuId per item, so a
+        // free-text "add my usuals to the cart" left the model with no real
+        // value to put there. It filled the field with the only string it
+        // had (the spinId itself) rather than refusing, and that update_cart
+        // call had zero verification (see the case below) — Swiggy silently
+        // dropped the one item where its self-correct-from-spinId behavior
+        // didn't save it (confirmed: MEAT WINDOW Chicken Curry Cut vanished
+        // from a 4-item add with no error surfaced anywhere). Not a model
+        // reliability problem; the tool contract was unsatisfiable.
         return {
           usuals: dbListUsuals().map((u) => ({
             spinId: u.spinId,
+            skuId: u.skuId,
             name: u.displayName,
             brand: u.brand,
             size: u.quantityDescription,
@@ -1716,7 +1825,19 @@ export async function clearCartDirect({ addressId, displayText = "Clear my cart"
   try {
     await instamartClient.clearCart();
     cart = await instamartClient.getCartOrEmpty();
-    reply = "Your cart is now empty.";
+    // Never report "cleared" from the call not throwing — same discipline as
+    // addItemDirect and addUsualsBestEffort, which both learned the hard way
+    // that Swiggy can return success on a cart write that didn't fully take.
+    // clear_cart is idempotent, so a second one costs nothing if the first
+    // actually worked and the read was just early.
+    if ((cart?.items || []).length > 0) {
+      await instamartClient.clearCart();
+      cart = await instamartClient.getCartOrEmpty();
+    }
+    reply =
+      (cart?.items || []).length === 0
+        ? "Your cart is now empty."
+        : "Swiggy still shows items in your cart — give it a moment and try clearing again.";
   } catch (err) {
     rethrowIfReauth(err);
     reply = `Couldn't clear the cart — ${String(err.message || "").split("\n")[0]}`;
@@ -2194,22 +2315,50 @@ export function getUsuals() {
 // real e-commerce cart stepper behaves (clicking + a few times shouldn't
 // spam the conversation log). quantity <= 0 removes the item entirely.
 export async function setItemQuantity({ addressId, spinId, skuId, quantity }) {
+  // Absolute target, not a merge — `items` below IS the complete desired cart.
+  // That makes replaying it on a retry safe in a way recomputing a merge never
+  // is (see mergeAndUpdateCart's note on the quantity-doubling bug).
+  const landed = (c) => {
+    const line = (c?.items || []).find((i) => itemKey(i.spinId) === itemKey(spinId));
+    return quantity > 0 ? line?.quantity === quantity : !line;
+  };
+
   try {
     const current = await instamartClient.getCartOrEmpty();
+    // Matched on spinId alone, exactly like itemKey/mergeAndUpdateCart: the
+    // same spinId can carry a different skuId at different resolution times
+    // (confirmed live), and a spinId+skuId filter that misses the existing
+    // line would leave it in place AND push a second entry for the same
+    // product — the documented route to a silently doubled quantity.
     const items = (current.items || [])
-      .filter((i) => !(String(i.spinId) === String(spinId) && String(i.skuId) === String(skuId)))
+      .filter((i) => itemKey(i.spinId) !== itemKey(spinId))
       .map((i) => ({ spinId: i.spinId, skuId: i.skuId, quantity: i.quantity }));
-    if (quantity > 0) items.push({ spinId, skuId, quantity });
-    if (items.length === 0) {
-      // update_cart rejects an empty items array ("items array is required
-      // and must contain at least one item", confirmed live) — removing the
-      // very last item in the cart has to go through clear_cart instead.
-      await instamartClient.clearCart();
-    } else {
-      await instamartClient.updateCart({ selectedAddressId: addressId, items });
-    }
-    const cart = await instamartClient.getCartOrEmpty();
-    return { cart };
+    // Prefer the skuId already settled in the live cart over the one the
+    // frontend rendered with, for the same reason.
+    const settledSkuId = (current.items || []).find((i) => itemKey(i.spinId) === itemKey(spinId))?.skuId;
+    if (quantity > 0) items.push({ spinId, skuId: settledSkuId ?? skuId, quantity });
+
+    const write = async () => {
+      if (items.length === 0) {
+        // update_cart rejects an empty items array ("items array is required
+        // and must contain at least one item", confirmed live) — removing the
+        // very last item in the cart has to go through clear_cart instead.
+        await instamartClient.clearCart();
+      } else {
+        await instamartClient.updateCart({ selectedAddressId: addressId, items });
+      }
+      return instamartClient.getCartOrEmpty();
+    };
+
+    let cart = await write();
+    // Verify the quantity actually landed rather than trusting a non-throwing
+    // call. Resending the identical absolute target is idempotent, so this
+    // can't double anything the way a recomputed merge would.
+    if (!landed(cart)) cart = await write();
+
+    return landed(cart)
+      ? { cart }
+      : { cart, error: "Swiggy didn't accept that quantity — it may be at this item's per-order limit." };
   } catch (err) {
     rethrowIfReauth(err);
     const cart = await instamartClient.getCartOrEmpty().catch(() => null);
